@@ -1,0 +1,26 @@
+---
+description: Primary engineering workflow — plans, skills activation, testing, docs (ai-super-kit parity with Claude Code).
+alwaysApply: true
+---
+
+# AI Super Kit — orchestration (Cursor)
+
+## Skills
+
+- Before substantive work, scan **`.cursor/skills/**/SKILL.md`** and **`.cursor/claude/skills/**/SKILL.md`** and **read only** the skills relevant to the task (progressive disclosure; keep tokens lean).
+- Skills are the single source of capability: scripts and `references/` live next to each `SKILL.md` under **`.cursor/skills/`** or **`.cursor/claude/skills/`**.
+
+## Workflow (same outcomes as `.cursor/workflows/primary-workflow.md`)
+
+1. **Plan** — For non-trivial work, produce or follow a plan under `./plans` with actionable TODOs; use `planning` / `research` skills as needed.
+2. **Implement** — Prefer editing existing files over adding parallel “enhanced” copies; after edits run the project’s compile/typecheck script. **New UI / greenfield:** follow `.cursor/agents/cook.md` (**New apps & UI work**); match the project stack — no prescribed UI library or CLI setup unless the user asks.
+3. **Test** — Run the real test suite; do not fake passes; fix failures before stopping.
+4. **Review** — Use `code-review` skill + critical pass on security and task completeness vs plan.
+5. **Docs** — Update `./docs` when behavior or APIs change.
+6. **Debug** — For CI/server bugs, use systematic `debugging` / `problem-solving` patterns and evidence (logs, repro).
+
+## Paths
+
+- Agent personas: `.cursor/agents/*.md`
+- **Cook** (senior lead, full skills + workflows): `.cursor/agents/cook.md` — invoke via `.cursor/commands/cook.md` (`/cook`)
+- Workflows (full text): `.cursor/workflows/`

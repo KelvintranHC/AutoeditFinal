@@ -1,0 +1,100 @@
+{
+  "entities": {
+    "Project": {
+      "title": "Project",
+      "description": "Represents a user project containing its script and generated scenes.",
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "The name of the project."
+        },
+        "script": {
+          "type": "string",
+          "description": "The script text."
+        },
+        "scenes": {
+          "type": "string",
+          "description": "A JSON string of the scenes data. We store as JSON string to easily circumvent arbitrary object strict schema rules, but size is bounded."
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner UID."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "timestamp",
+          "description": "Creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "timestamp",
+          "description": "Last update timestamp."
+        }
+      },
+      "required": ["title", "userId", "script", "scenes", "createdAt", "updatedAt"]
+    },
+    "VideoDownload": {
+      "title": "VideoDownload",
+      "description": "Stores completed video downloads.",
+      "type": "object",
+      "properties": {
+        "stockUrl": {
+          "type": "string",
+          "description": "Unique source URL of the video."
+        },
+        "driveLink": {
+          "type": "string",
+          "description": "Direct link to the file on Drive."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "timestamp",
+          "description": "Timestamp when this record was created."
+        }
+      },
+      "required": ["stockUrl", "driveLink", "createdAt"]
+    },
+    "UserDriveConfig": {
+      "title": "UserDriveConfig",
+      "description": "Stores Drive folder link for a user.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Owner UID."
+        },
+        "folderLink": {
+          "type": "string",
+          "description": "Google Drive folder link set by the user."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "timestamp",
+          "description": "Timestamp of last update."
+        }
+      },
+      "required": ["userId", "folderLink", "updatedAt"]
+    }
+  },
+  "firestore": {
+    "projects/{projectId}": {
+      "schema": {
+        "$ref": "#/entities/Project"
+      },
+      "description": "Stores user projects."
+    },
+    "videoDownloads/{stockUrl}": {
+      "schema": {
+        "$ref": "#/entities/VideoDownload"
+      },
+      "description": "Stores completed video downloads."
+    },
+    "userDriveConfigs/{userId}": {
+      "schema": {
+        "$ref": "#/entities/UserDriveConfig"
+      },
+      "description": "Stores Drive folder link for a user."
+    }
+  }
+}

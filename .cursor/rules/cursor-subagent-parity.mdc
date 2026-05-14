@@ -1,0 +1,15 @@
+---
+description: How to use Claude-style subagents in Cursor (no Task spawn — persona + files).
+alwaysApply: true
+---
+
+# Subagent parity in Cursor
+
+Claude Code can spawn subagents via **Task**. Cursor does **not** expose the same spawn API. Preserve **identical outcomes** by:
+
+1. **Adopt the persona** — Open `.cursor/agents/<name>.md` for the role you need (`planner`, `code-reviewer`, `tester`, `debugger`, `docs-manager`, `scout`, `git-manager`, etc.) and follow its instructions, outputs, and report paths in this conversation.
+2. **Slash commands** — Strings like `/scout` or `/scout:ext` refer to **Claude Code** command definitions under `.cursor/claude/commands/`. In Cursor, replicate intent with **Grep**, **Glob**, **semantic codebase search**, and parallel scoped searches (see notes inside `scout.md` / `scout-external.md`).
+3. **MCP** — Project config: prefer **`.cursor/mcp.json`**; fallback **`.cursor/claude/.mcp.json`**. The `mcp-management` skill tries both.
+4. **Models** — YAML `model:` lines in agent files are Claude Code hints; ignore for Cursor model picker unless you pin rules elsewhere.
+
+Keep report filenames and `./plans/.../reports/` handoffs unchanged so cross-agent workflows stay compatible.

@@ -1,0 +1,114 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+    
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    
+    function isSignedIn() { 
+      return request.auth != null; 
+    }
+    
+    function isOwner(userId) {
+      return (isSignedIn() && userId == request.auth.uid) 
+          || (request.auth == null && userId is string && userId.startsWith('guest_'));
+    }
+
+    function isValidProject(data) {
+      return data.keys().hasAll(['title', 'userId', 'script', 'scenes', 'createdAt', 'updatedAt'])
+          && data.keys().size() == 6
+          && data.title is string && data.title.size() >= 1 && data.title.size() <= 200
+          && data.userId is string && data.userId.size() <= 128
+          && data.script is string && data.script.size() <= 1000000
+          && data.scenes is string && data.scenes.size() <= 2000000
+          && data.createdAt is timestamp
+          && data.updatedAt is timestamp;
+    }
+
+    match /projects/{projectId} {
+      allow get: if isValidId(projectId) && (
+        (request.auth != null && resource.data.userId == request.auth.uid) ||
+        (request.auth == null && resource.data.userId is string && resource.data.userId.startsWith('guest_'))
+      );
+      
+      allow list: if (request.auth != null && resource.data.userId == request.auth.uid) ||
+                  (request.auth == null && resource.data.userId is string && resource.data.userId.startsWith('guest_'));
+
+      allow create: if isValidId(projectId)
+                    && isOwner(incoming().userId)
+                    && isValidProject(incoming())
+                    && incoming().createdAt == request.time
+                    && incoming().updatedAt == request.time;
+      
+      allow update: if isValidId(projectId)
+                    && isOwner(existing().userId)
+                    && isOwner(incoming().userId)
+                    && isValidProject(incoming())
+                    && incoming().userId == existing().userId
+                    && ((incoming().createdAt == existing().createdAt) || !('createdAt' in existing()))
+                    && incoming().updatedAt == request.time
+                    && (
+                      incoming().diff(existing()).affectedKeys().hasOnly(['title', 'script', 'scenes', 'updatedAt'])
+                    );
+
+      allow delete: if isValidId(projectId) && isOwner(existing().userId);
+    }
+
+    function isValidVideoDownload(data) {
+      return data.keys().hasAll(['stockUrl', 'driveLink', 'createdAt']) && data.keys().size() == 3
+          && data.stockUrl is string && data.stockUrl.size() <= 2083
+          && data.driveLink is string && data.driveLink.size() <= 2083
+          && data.createdAt is timestamp;
+    }
+
+    function isValidMergeJob(data) {
+      return data.keys().hasAll(['projectId', 'status', 'progress', 'createdAt'])
+          && data.projectId is string && data.projectId.size() <= 128
+          && data.status is string
+          && data.progress is number
+          && data.createdAt is timestamp;
+    }
+
+    match /mergeJobs/{mergeJobId} {
+      allow create: if isSignedIn() && isValidMergeJob(incoming());
+      allow read: if isSignedIn();
+      allow update: if isSignedIn();
+    }
+
+    function isValidUserDriveConfig(data) {
+      return data.userId is string && data.userId.size() <= 128
+          && data.folderLink is string && data.folderLink.size() <= 2083
+          && data.updatedAt is timestamp;
+    }
+
+    match /userDriveConfigs/{userId} {
+      allow get: if isSignedIn() && userId == request.auth.uid;
+      allow create, update: if isSignedIn() && userId == request.auth.uid 
+                          && incoming().userId == request.auth.uid
+                          && isValidUserDriveConfig(incoming());
+    }
+
+    match /videoDownloads/{stockUrl} {
+      allow read: if true;
+      allow create, update: if true; 
+    }
+    
+    match /proxyLogs/{logId} {
+      allow read, write: if isSignedIn();
+    }
+    
+    match /test/connection {
+      allow read: if isSignedIn();
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "V6 Remix: AI Script-to-Video",
+  "description": "Analyzes news scripts, splits them into scenes, generates keywords, and automatically fetches preview videos from Storyblocks.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}

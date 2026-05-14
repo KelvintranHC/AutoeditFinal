@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(npm install *)",
+      "Bash(npm run *)",
+      "Bash(ps -p 4032 -o pid,ppid,command)",
+      "Bash(grep -v '^$')",
+      "Bash(npx tsc *)",
+      "Bash(lsof -ti:3001)",
+      "Bash(xargs -r kill -9)",
+      "Bash(curl -s http://localhost:3001/api/auth/google/status)",
+      "Bash(curl -s -o /tmp/login_resp.html -w \"HTTP %{http_code}\\\\n\" http://localhost:3001/api/auth/google/login)",
+      "Read(//tmp/**)",
+      "Bash(curl -s -w \"\\\\nHTTP %{http_code}\\\\n\" http://localhost:3001/api/auth/google/token)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\nLocation: %{redirect_url}\\\\n\" http://localhost:3001/api/auth/google/login)",
+      "Bash(curl -s -o /dev/null -w \"Login redirect: HTTP %{http_code}\\\\n\" http://localhost:3001/api/auth/google/login)",
+      "Bash(node -e \"const t = JSON.parse\\(require\\('fs'\\).readFileSync\\('.drive-token.json','utf-8'\\)\\); console.log\\('Has refresh_token:', !!t.refresh_token\\); console.log\\('Has access_token:', !!t.access_token\\); console.log\\('Scope:', t.scope\\); console.log\\('Expiry:', new Date\\(t.expiry_date\\).toISOString\\(\\)\\);\")",
+      "Bash(curl -s http://localhost:3001/api/auth/google/token)",
+      "Bash(node -e \"let d=''; process.stdin.on\\('data',c=>d+=c\\).on\\('end',\\(\\)=>{const o=JSON.parse\\(d\\); console.log\\('accessToken length:', o.accessToken?.length, 'prefix:', o.accessToken?.slice\\(0,10\\)+'...'\\)}\\)\")"
+    ]
+  }
+}

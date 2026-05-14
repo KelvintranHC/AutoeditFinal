@@ -1,0 +1,21 @@
+---
+description: Map legacy .agents paths to .cursor equivalents.
+alwaysApply: true
+---
+
+# Legacy `.agents` compatibility
+
+When instructions, notes, or scripts mention paths under `.agents/`, treat them as legacy aliases.
+
+Use these `.cursor/` equivalents by default:
+
+- `.agents/skills/...` -> **`.cursor/claude/skills/...`** (repo `.agents/skills` was consolidated into the Claude bundle tree; some skills are also mirrored under **`.cursor/skills/...`**)
+- `.agents/<name>.md` -> `.cursor/agents/<name>.md`
+- `.claude/commands/...` -> **`.cursor/commands/...`** (Cursor wrappers) and **`.cursor/claude/commands/...`** (Claude Code bundle inside `.cursor/`); see `claude-commands-cursor-parity.mdc`
+- Repo-root **`.claude/`** can be removed after confirming **`.cursor/claude/`** contains the same bundle
+
+Migration policy:
+
+1. Prefer adding or updating files under `.cursor/` only.
+2. Do not overwrite existing `.cursor/` files unless explicitly requested.
+3. Keep behavior additive and backward-compatible.

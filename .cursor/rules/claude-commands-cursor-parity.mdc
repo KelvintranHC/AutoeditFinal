@@ -1,0 +1,14 @@
+---
+description: Claude Code bundle at .cursor/claude/commands vs .cursor/commands + .cursor/agents; /cook orchestration.
+alwaysApply: true
+---
+
+# Claude commands → Cursor (parity)
+
+- **Legacy:** `.cursor/claude/commands/**` (Claude Code slash commands).
+- **Cursor commands:** `.cursor/commands/**` — same relative paths; each file lists `claude-legacy` and `cursor-agent` in frontmatter.
+- **Personas:** `.cursor/agents/*.md` — adopt in conversation (no Task spawn); see `.cursor/rules/cursor-subagent-parity.mdc`.
+- **Orchestration:** **`/cook`** → `.cursor/commands/cook.md` → `.cursor/agents/cook.md` (skills catalog, workflows, new-app UI guidance).
+- **Index:** Full mapping table: `.cursor/agents/claude-commands-parity.md`.
+
+When the user references a Claude-style command (e.g. `/plan:fast`, `/fix`), resolve it to **`.cursor/commands/plan/fast.md`** or **`fix/fast.md`** and the **primary agent** from the index.
