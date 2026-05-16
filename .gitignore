@@ -13,3 +13,4 @@ coverage/
 *.bin
 temp/
 .drive-token.json
+data/

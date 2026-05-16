@@ -1,7 +1,7 @@
 {
-  "name": "v6-remix-ai-script-to-video",
+  "name": "autoedit",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",

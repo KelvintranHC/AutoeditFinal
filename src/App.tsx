@@ -71,6 +71,28 @@ import {
   rankStockVideos,
 } from "./scenePlanning";
 import { buildGeminiJsonConfig } from "./geminiConfig";
+import {
+  APP_NAME,
+  APP_VERSION,
+  getAppFullLabel,
+  getAppUpdateLabel,
+  getAppVersionTitle,
+} from "./appInfo";
+import {
+  createProjectApi,
+  deleteProjectApi,
+  fetchProjects,
+  fetchUserConfig,
+  migrateProjectsApi,
+  saveUserConfigApi,
+  updateProjectApi,
+} from "./lib/projectApi";
+import {
+  type Project,
+  type UserAppConfig,
+  LEGACY_CONFIG_STORAGE_KEY,
+  LEGACY_PROJECTS_STORAGE_KEY,
+} from "./lib/projectTypes";
 
 /** AI Studio: gemini-2.0-flash trả 404 với key/user mới — dùng 2.5.x làm mặc định. */
 const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
@@ -131,20 +153,6 @@ interface Scene {
     summaryVi?: string;
     pacingZone?: "hook" | "body" | "ending";
   };
-}
-
-interface Project {
-  id: string;
-  title: string;
-  userId: string;
-  script: string;
-  scenes: string; // JSON string of Scene[]
-  /** Hướng visual / keyword cho AI (theo project). */
-  visualKeywordDirection?: string;
-  /** JSON stringify(PacingProfile). */
-  pacingProfileJson?: string;
-  createdAt: any;
-  updatedAt: any;
 }
 
 // Cache for storyblocks
@@ -774,45 +782,88 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [proxyLogs, setProxyLogs] = useState<ProxyLog[]>([]);
-  const [config, setConfig] = useState(() => {
-    const saved = localStorage.getItem("app-config-v2");
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        return {
-          transcriptionModel: migrateGeminiModelId(
-            parsed.transcriptionModel || DEFAULT_GEMINI_MODEL,
-          ),
-          analysisModel: migrateGeminiModelId(
-            parsed.analysisModel || DEFAULT_GEMINI_MODEL,
-          ),
-          exportResolution: parsed.exportResolution || "1080p",
-          geminiApiKey: parsed.geminiApiKey || "",
-          storyblocksProxies: parsed.storyblocksProxies || "",
-          storyblocksCookies: parsed.storyblocksCookies || "",
-          driveAccessToken: parsed.driveAccessToken || "",
-        };
-      } catch (e) {}
-    }
-    return {
-      transcriptionModel: DEFAULT_GEMINI_MODEL,
-      analysisModel: DEFAULT_GEMINI_MODEL,
-      exportResolution: "1080p",
-      geminiApiKey: "",
-      storyblocksProxies: "",
-      storyblocksCookies: "",
-      driveAccessToken: "",
-    };
+  const defaultAppConfig = (): UserAppConfig => ({
+    transcriptionModel: DEFAULT_GEMINI_MODEL,
+    analysisModel: DEFAULT_GEMINI_MODEL,
+    exportResolution: "1080p",
+    geminiApiKey: "",
+    storyblocksProxies: "",
+    storyblocksCookies: "",
+    driveAccessToken: "",
   });
+
+  const parseStoredConfig = (parsed: Record<string, unknown>): UserAppConfig => ({
+    transcriptionModel: migrateGeminiModelId(
+      (parsed.transcriptionModel as string) || DEFAULT_GEMINI_MODEL,
+    ),
+    analysisModel: migrateGeminiModelId(
+      (parsed.analysisModel as string) || DEFAULT_GEMINI_MODEL,
+    ),
+    exportResolution: (parsed.exportResolution as string) || "1080p",
+    geminiApiKey: (parsed.geminiApiKey as string) || "",
+    storyblocksProxies: (parsed.storyblocksProxies as string) || "",
+    storyblocksCookies: (parsed.storyblocksCookies as string) || "",
+    driveAccessToken: (parsed.driveAccessToken as string) || "",
+  });
+
+  const [config, setConfig] = useState<UserAppConfig>(defaultAppConfig);
+  const [configReady, setConfigReady] = useState(false);
 
   const [viewMode, setViewMode] = useState<"editor" | "downloader">("editor");
   const [downloadJobs, setDownloadJobs] = useState<any[]>([]);
   const [mergeJobId, setMergeJobId] = useState<string | null>(null);
 
+  useEffect(() => {
+    let cancelled = false;
+    const loadConfig = async () => {
+      try {
+        const legacyRaw = localStorage.getItem(LEGACY_CONFIG_STORAGE_KEY);
+        let legacyConfig: UserAppConfig | null = null;
+        if (legacyRaw) {
+          try {
+            legacyConfig = parseStoredConfig(JSON.parse(legacyRaw));
+          } catch {
+            /* ignore */
+          }
+        }
+        const remote = await fetchUserConfig();
+        if (cancelled) return;
+        if (remote) {
+          setConfig(parseStoredConfig(remote as unknown as Record<string, unknown>));
+        } else if (legacyConfig) {
+          setConfig(legacyConfig);
+          await saveUserConfigApi(legacyConfig);
+        }
+        if (legacyRaw) localStorage.removeItem(LEGACY_CONFIG_STORAGE_KEY);
+      } catch (e) {
+        console.error("[config] load failed", e);
+        const legacyRaw = localStorage.getItem(LEGACY_CONFIG_STORAGE_KEY);
+        if (legacyRaw) {
+          try {
+            setConfig(parseStoredConfig(JSON.parse(legacyRaw)));
+          } catch {
+            /* ignore */
+          }
+        }
+      } finally {
+        if (!cancelled) setConfigReady(true);
+      }
+    };
+    loadConfig();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
-    localStorage.setItem("app-config-v2", JSON.stringify(config));
-  }, [config]);
+    if (!configReady) return;
+    const timer = setTimeout(() => {
+      saveUserConfigApi(config).catch((e) =>
+        console.warn("[config] save failed", e),
+      );
+    }, 800);
+    return () => clearTimeout(timer);
+  }, [config, configReady]);
 
   const [visualKeywordDirection, setVisualKeywordDirection] = useState("");
 
@@ -1040,21 +1091,6 @@ export default function App() {
     }
   };
 
-  // LocalStorage Projects Helper
-  const LOCAL_STORAGE_KEY = "video_editor_projects";
-  const getLocalProjects = (): Project[] => {
-    try {
-       const data = localStorage.getItem(LOCAL_STORAGE_KEY);
-       if (data) return JSON.parse(data);
-    } catch (e) {
-       console.error("Failed to parse local projects", e);
-    }
-    return [];
-  };
-  const saveLocalProjects = (projs: Project[]) => {
-     localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(projs));
-  };
-
   const openProjectStudioSetup = () => {
     if (!selectedProjectId) return;
     setStudioDraftVisual(visualKeywordDirection);
@@ -1062,30 +1098,23 @@ export default function App() {
     setIsProjectStudioSetupOpen(true);
   };
 
-  const persistProjectStudioFields = (
+  const persistProjectStudioFields = async (
     visual: string,
     pacing: PacingProfile,
   ) => {
     if (!selectedProjectId) return;
-    const allProjs = getLocalProjects();
-    const idx = allProjs.findIndex((p) => p.id === selectedProjectId);
-    if (idx === -1) return;
-    allProjs[idx].visualKeywordDirection = visual;
-    allProjs[idx].pacingProfileJson = JSON.stringify(pacing);
-    allProjs[idx].updatedAt = new Date().toISOString();
-    saveLocalProjects(allProjs);
-    setProjects((prev) =>
-      prev.map((p) =>
-        p.id === selectedProjectId
-          ? {
-              ...p,
-              visualKeywordDirection: visual,
-              pacingProfileJson: JSON.stringify(pacing),
-              updatedAt: allProjs[idx].updatedAt,
-            }
-          : p,
-      ),
-    );
+    try {
+      const updated = await updateProjectApi(selectedProjectId, {
+        visualKeywordDirection: visual,
+        pacingProfileJson: JSON.stringify(pacing),
+      });
+      setProjects((prev) =>
+        prev.map((p) => (p.id === selectedProjectId ? updated : p)),
+      );
+    } catch (e) {
+      console.error("persistProjectStudioFields", e);
+      toast.error("Không lưu được thiết lập dự án lên server.");
+    }
   };
 
   const applyProjectStudioSetup = () => {
@@ -1101,24 +1130,37 @@ export default function App() {
     setIsProjectStudioSetupOpen(false);
   };
 
-  // Projects Subscription
   useEffect(() => {
-    const loadProjects = () => {
-       const currentUserId = user?.uid || guestId;
-       const allProjs = getLocalProjects();
-       const userProjs = allProjs.filter(p => p.userId === currentUserId);
-       
-       userProjs.sort((a, b) => {
-          const timeA = new Date(a.createdAt).getTime() || 0;
-          const timeB = new Date(b.createdAt).getTime() || 0;
-          return timeB - timeA;
-       });
-       setProjects(userProjs);
+    let cancelled = false;
+    const loadProjectsFromBackend = async () => {
+      try {
+        const legacyRaw = localStorage.getItem(LEGACY_PROJECTS_STORAGE_KEY);
+        if (legacyRaw) {
+          try {
+            const legacy = JSON.parse(legacyRaw) as Project[];
+            if (legacy.length > 0) {
+              await migrateProjectsApi(legacy);
+            }
+          } catch (e) {
+            console.warn("[projects] legacy migrate parse failed", e);
+          }
+          localStorage.removeItem(LEGACY_PROJECTS_STORAGE_KEY);
+        }
+        const list = await fetchProjects();
+        if (!cancelled) setProjects(list);
+      } catch (e) {
+        console.error("[projects] load failed", e);
+        if (!cancelled) {
+          toast.error("Không tải được dự án từ server.");
+          setProjects([]);
+        }
+      }
     };
-    
-    loadProjects();
-    // Optional: add listener for window events if needed, but not strictly necessary for single tab
-  }, [user]);
+    loadProjectsFromBackend();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Load selected project
   useEffect(() => {
@@ -1142,11 +1184,20 @@ export default function App() {
       } catch {
         setPacingProfile({ ...DEFAULT_PACING_PROFILE });
       }
+      const persistedAudio = proj.audioUrl;
+      if (persistedAudio && /^https?:\/\//i.test(persistedAudio)) {
+        setAudioUrl(persistedAudio);
+      } else {
+        setAudioUrl(null);
+      }
+      setDownloadUrl(proj.downloadUrl || null);
     } else {
       setScript("");
       setScenes([]);
       setVisualKeywordDirection("");
       setPacingProfile({ ...DEFAULT_PACING_PROFILE });
+      setAudioUrl(null);
+      setDownloadUrl(null);
     }
   }, [selectedProjectId, projects]);
 
@@ -1156,27 +1207,18 @@ export default function App() {
 
     setIsCreatingProject(true);
     try {
-      const currentUserId = user?.uid || guestId;
-      const newRefId = "proj_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
-      const newProject: Project = {
-        id: newRefId,
-        title: newProjectTitle.trim(),
-        userId: currentUserId,
-        script: "",
-        scenes: "",
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-      
-      const allProjs = getLocalProjects();
-      allProjs.push(newProject);
-      saveLocalProjects(allProjs);
-      
-      setProjects(prev => [newProject, ...prev]);
+      const newRefId =
+        "proj_" + Date.now() + "_" + Math.random().toString(36).substr(2, 9);
+      const newProject = await createProjectApi(
+        newProjectTitle.trim(),
+        newRefId,
+      );
+
+      setProjects((prev) => [newProject, ...prev]);
 
       setNewProjectTitle("");
-      setSelectedProjectId(newRefId);
-      toast.success("Project created");
+      setSelectedProjectId(newProject.id);
+      toast.success("Đã tạo dự án");
     } catch (error: any) {
       console.error(error);
       const msg = error instanceof Error ? error.message : String(error);
@@ -1194,11 +1236,9 @@ export default function App() {
     console.log("Request to delete project:", projectId);
     const toastId = toast.loading("Đang xoá dự án...");
     try {
-      let allProjs = getLocalProjects();
-      allProjs = allProjs.filter(p => p.id !== projectId);
-      saveLocalProjects(allProjs);
-      
-      setProjects(prev => prev.filter(p => p.id !== projectId));
+      await deleteProjectApi(projectId);
+
+      setProjects((prev) => prev.filter((p) => p.id !== projectId));
 
       if (selectedProjectId === projectId) {
         setSelectedProjectId(null);
@@ -1225,16 +1265,13 @@ export default function App() {
     }
 
     try {
-      const allProjs = getLocalProjects();
-      const idx = allProjs.findIndex(p => p.id === editingProjectId);
-      if (idx !== -1) {
-        allProjs[idx].title = editingProjectTitle.trim();
-        allProjs[idx].updatedAt = new Date().toISOString();
-        saveLocalProjects(allProjs);
-        
-        setProjects(prev => prev.map(p => p.id === editingProjectId ? {...p, title: editingProjectTitle.trim()} : p));
-      }
-      
+      const updated = await updateProjectApi(editingProjectId, {
+        title: editingProjectTitle.trim(),
+      });
+      setProjects((prev) =>
+        prev.map((p) => (p.id === editingProjectId ? updated : p)),
+      );
+
       setEditingProjectId(null);
       toast.success("Đã đổi tên dự án");
     } catch (error) {
@@ -1252,7 +1289,16 @@ export default function App() {
       }, 2000); // 2-second debounce to prevent excessive Firestore writes
       return () => clearTimeout(timer);
     }
-  }, [isDirty, script, scenes, visualKeywordDirection, pacingProfile, selectedProjectId]);
+  }, [
+    isDirty,
+    script,
+    scenes,
+    visualKeywordDirection,
+    pacingProfile,
+    audioUrl,
+    downloadUrl,
+    selectedProjectId,
+  ]);
 
   const saveProjectState = async (
     newScript: string,
@@ -1264,25 +1310,27 @@ export default function App() {
     if (manual) setIsSaving(true);
     try {
       const cleanedScenes = JSON.parse(JSON.stringify(newScenes));
-      
-      const allProjs = getLocalProjects();
-      const idx = allProjs.findIndex(p => p.id === selectedProjectId);
-      if (idx !== -1) {
-         allProjs[idx].script = newScript;
-         allProjs[idx].scenes = JSON.stringify(cleanedScenes);
-         allProjs[idx].visualKeywordDirection = visualKeywordDirection;
-         allProjs[idx].pacingProfileJson = JSON.stringify(pacingProfile);
-         allProjs[idx].updatedAt = new Date().toISOString();
-         saveLocalProjects(allProjs);
-         
-         setProjects(prev => prev.map(p => p.id === selectedProjectId ? {...p, script: newScript, scenes: JSON.stringify(cleanedScenes), visualKeywordDirection, pacingProfileJson: JSON.stringify(pacingProfile), updatedAt: allProjs[idx].updatedAt} : p));
-      }
-      
-      setIsDirty(false); // Reset dirty flag after successful save
-      if (manual) toast.success("Project saved");
+      const persistAudio =
+        audioUrl && /^https?:\/\//i.test(audioUrl) ? audioUrl : null;
+
+      const updated = await updateProjectApi(selectedProjectId, {
+        script: newScript,
+        scenes: JSON.stringify(cleanedScenes),
+        visualKeywordDirection,
+        pacingProfileJson: JSON.stringify(pacingProfile),
+        audioUrl: persistAudio,
+        downloadUrl: downloadUrl || null,
+      });
+
+      setProjects((prev) =>
+        prev.map((p) => (p.id === selectedProjectId ? updated : p)),
+      );
+
+      setIsDirty(false);
+      if (manual) toast.success("Đã lưu dự án lên server");
     } catch (error: any) {
       console.error("Save error:", error);
-      if (manual) toast.error("Failed to save project");
+      if (manual) toast.error("Lưu dự án thất bại");
     } finally {
       if (manual) setIsSaving(false);
     }
@@ -1816,7 +1864,7 @@ Văn bản: ${script}`;
 
     XLSX.writeFile(
       workbook,
-      `StoryFlow_Export_${new Date().toISOString().split("T")[0]}.xlsx`,
+      `${APP_NAME}_Ver${APP_VERSION}_Export_${new Date().toISOString().split("T")[0]}.xlsx`,
     );
   };
 
@@ -2042,6 +2090,7 @@ Văn bản: ${script}`;
               toast.success("Video đã sẵn sàng!");
               setIsExporting(false);
               setDownloadUrl(sData.downloadUrl);
+              setIsDirty(true);
 
               // Fix for iframe download: Try window.open first, it's more reliable in some iframes
               try {
@@ -2099,7 +2148,7 @@ Văn bản: ${script}`;
       <div className="h-screen w-full bg-slate-950 flex flex-col items-center justify-center gap-4">
         <Loader2 className="w-10 h-10 text-indigo-500 animate-spin" />
         <p className="text-slate-400 font-mono text-xs uppercase tracking-widest animate-pulse">
-          Initializing Secure Environment...
+          {getAppVersionTitle()} — đang khởi động...
         </p>
       </div>
     );
@@ -2165,25 +2214,33 @@ Văn bản: ${script}`;
           <div className="w-8 h-8 md:w-10 md:h-10 rounded-xl bg-gradient-to-br from-indigo-500 to-purple-600 flex items-center justify-center shadow-lg shadow-indigo-500/20">
             <MonitorPlay size={18} className="text-white" />
           </div>
-          <h1 className="text-base md:text-lg font-medium tracking-tight">
-            StoryFlow <span className="text-indigo-400">AI</span>
-          </h1>
-          <div className="ml-6 flex items-center bg-black/40 p-1 rounded-lg border border-white/5">
-             <button 
-               onClick={() => setViewMode("editor")}
-               className={`px-3 py-1 text-[10px] font-bold uppercase tracking-wider rounded-md transition-all ${viewMode === "editor" ? "bg-indigo-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"}`}
-             >
-               Studio
-             </button>
-             <button 
-               onClick={() => setViewMode("downloader")}
-               className={`px-3 py-1 text-[10px] font-bold uppercase tracking-wider rounded-md transition-all ${viewMode === "downloader" ? "bg-emerald-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"}`}
-             >
-                Automation
-             </button>
+          <div className="flex flex-col min-w-0">
+            <h1 className="text-base md:text-lg font-medium tracking-tight truncate">
+              {getAppVersionTitle().replace("_", " ")}
+            </h1>
+            <span className="text-[10px] text-slate-500 font-mono truncate">
+              {getAppUpdateLabel()}
+            </span>
           </div>
-          <span className="hidden sm:inline-block px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 text-[10px] uppercase font-bold border border-indigo-500/20">
-            MVP Studio
+          <div className="ml-4 md:ml-6 flex items-center bg-black/40 p-1 rounded-lg border border-white/5">
+            <button
+              onClick={() => setViewMode("editor")}
+              className={`px-3 py-1 text-[10px] font-bold uppercase tracking-wider rounded-md transition-all ${viewMode === "editor" ? "bg-indigo-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"}`}
+            >
+              Studio
+            </button>
+            <button
+              onClick={() => setViewMode("downloader")}
+              className={`px-3 py-1 text-[10px] font-bold uppercase tracking-wider rounded-md transition-all ${viewMode === "downloader" ? "bg-emerald-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"}`}
+            >
+              Automation
+            </button>
+          </div>
+          <span
+            className="hidden lg:inline-block px-2 py-0.5 rounded bg-indigo-500/10 text-indigo-400 text-[10px] font-mono font-bold border border-indigo-500/20"
+            title={getAppUpdateLabel()}
+          >
+            Ver {APP_VERSION}
           </span>
         </div>
         <div className="flex items-center gap-2 md:gap-3">
@@ -3658,6 +3715,11 @@ Văn bản: ${script}`;
               </section>
             </div>
 
+            <div className="px-4 py-2 border-t border-white/5 bg-black/30">
+              <p className="text-[10px] font-mono text-slate-500 text-center">
+                {getAppFullLabel()}
+              </p>
+            </div>
             <div className="p-4 border-t border-white/5 bg-white/5 flex gap-3">
               <button
                 onClick={() => setIsSettingsOpen(false)}

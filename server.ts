@@ -598,8 +598,11 @@ function getBrowserExecutablePath() {
   return undefined;
 }
 
+import { registerProjectRoutes } from "./lib/projectRoutes.js";
+
 const app = express();
 app.use(express.json({ limit: "50mb" }));
+registerProjectRoutes(app);
 
 const activeJobs = new Map<
   string,
@@ -2512,7 +2515,14 @@ async function getHqBrowser() {
 }
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    storage: "shared-json",
+    requiresUserId: false,
+    apiVersion: "projects-shared-v2",
+  });
 });
 
 // Downloader Manager State
