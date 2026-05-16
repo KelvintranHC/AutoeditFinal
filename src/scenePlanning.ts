@@ -14,9 +14,7 @@ export interface MeaningBeat {
   end_line_index: number;
   summary_vi: string;
   topic: string;
-  emotion: string;
   importance: number;
-  visual_potential: string;
   suggested_visual_direction_en: string;
 }
 
@@ -269,9 +267,7 @@ export function prepareMeaningBeats(
       end_line_index: i,
       summary_vi: "",
       topic: "general",
-      emotion: "neutral",
       importance: 2,
-      visual_potential: "supporting visuals",
       suggested_visual_direction_en: "relevant stock b-roll to narration",
     }));
   }
@@ -311,9 +307,7 @@ export function prepareMeaningBeats(
         end_line_index: cursor,
         summary_vi: "",
         topic: "general",
-        emotion: "neutral",
         importance: 2,
-        visual_potential: "context",
         suggested_visual_direction_en: "generic contextual footage",
       });
       cursor++;
@@ -327,9 +321,7 @@ export function prepareMeaningBeats(
       end_line_index: cursor,
       summary_vi: "",
       topic: "general",
-      emotion: "neutral",
       importance: 2,
-      visual_potential: "context",
       suggested_visual_direction_en: "generic contextual footage",
     });
     cursor++;
@@ -556,38 +548,33 @@ export function mergeMeaningBeatsToVisualScenes(
   return split.length > 0 ? split : enforced;
 }
 
+function compactJson(value: unknown): string {
+  return JSON.stringify(value);
+}
+
+/** Giới hạn narration trong prompt keywords — đủ ngữ cảnh, giảm prompt token. */
+function truncateForPrompt(text: string, max = 320): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length <= max) return t;
+  return `${t.slice(0, max - 1)}…`;
+}
+
 export function buildMeaningBeatsPrompt(
   lines: { index: number; text: string; start_sec: number; end_sec: number }[],
   visualStyleUserNotes: string,
 ): string {
   const style = (visualStyleUserNotes || "").trim();
-  return `You are a senior documentary story analyst. Input is SRT subtitle LINES (0-based index) with approximate times.
+  const lastIdx = lines.length - 1;
+  return `SRT analyst. Group 0-based lines into meaning beats. JSON only, no prose.
 
-TASK — Layer "Meaning beat" ONLY:
-For each SEMANTIC unit (may be 1+ consecutive lines), output a meaning beat with:
-- start_line_index, end_line_index (inclusive, 0..${lines.length - 1})
-- summary_vi: short Vietnamese summary of this beat (for editor notes)
-- topic: 2-5 word English label
-- emotion: English (e.g. hopeful, urgent, calm)
-- importance: integer 1-5
-- visual_potential: English phrase — how this could look on screen
-- suggested_visual_direction_en: English — concrete shot ideas / setting
+Each beat: start_line_index, end_line_index (0..${lastIdx}), summary_vi (short VI), topic (2-4 EN words), importance (1-5), suggested_visual_direction_en (short EN shot idea).
 
-Rules:
-- Cover ALL lines exactly once with NO gaps and NO overlaps.
-- NEVER output a single meaning beat that spans the entire transcript when there are more than 5 subtitle lines OR total audio duration exceeds ~25 seconds — split into multiple beats aligned to natural pauses / topic shifts.
-- Merge lines only when they express ONE tight idea; split when topic or visual direction shifts.
-- Respect fast pacing in the first ~60s: prefer smaller beats (more visual opportunities) unless lines are clearly one thought.
-- If user "Visual style / keyword direction" is provided, bias topics and suggested_visual_direction_en toward it.
+Rules: cover every line once, no gaps/overlaps; do not use one beat for the whole file if >5 lines or duration >25s; merge only same idea; split on topic/visual shift; first ~60s prefer smaller beats.
+Style hint: ${style || "none"}
 
-User visual style / keyword direction (may be Vietnamese or English):
-${style || "(none)"}
+Lines:${compactJson(lines)}
 
-Lines JSON:
-${JSON.stringify(lines)}
-
-Return ONLY valid JSON:
-{"meaning_beats":[{"start_line_index":0,"end_line_index":1,"summary_vi":"...","topic":"...","emotion":"...","importance":3,"visual_potential":"...","suggested_visual_direction_en":"..."}]}`;
+{"meaning_beats":[{"start_line_index":0,"end_line_index":0,"summary_vi":"","topic":"","importance":3,"suggested_visual_direction_en":""}]}`;
 }
 
 export function buildSceneKeywordsPrompt(
@@ -599,32 +586,21 @@ export function buildSceneKeywordsPrompt(
     scene_index: idx,
     pacing_zone: d.pacingZone,
     duration_sec: Math.round(d.durationSec * 10) / 10,
-    narration_text: d.text,
-    summary_vi: d.summaryVi,
-    topics: d.topics,
-    visual_hints_en: d.visualHintsEn,
+    narration: truncateForPrompt(d.text),
+    summary_vi: d.summaryVi.slice(0, 160),
+    topics: d.topics.slice(0, 4),
+    visual_hints_en: d.visualHintsEn.slice(0, 3),
   }));
 
-  return `You create Storyblocks / stock-footage search strategy.
+  return `Stock-footage keyword planner. JSON only. All search strings in English (2-5 words each), natural for Storyblocks — not literal VI translation.
 
-USER visual style & constraints (any language; use as intent, not literal translation):
-${style || "(none)"}
+Style: ${style || "none"}
 
-For EACH scene below, output:
-- keywords: 3-5 ENGLISH search phrases. Each phrase must be natural for stock video search (2-5 words), NOT literal word-by-word translation of Vietnamese. Example: prefer "children learning in nature" NOT "bamboo school education identity".
-- fallback_keywords: 2-4 BROADER English phrases if primary searches are too narrow.
-- avoid_terms: 3-8 English terms to AVOID in titles/thumbnails (wrong mood, cliché, off-topic).
-- storyblocks_search_queries: 3-5 ENGLISH queries (can match keywords but optimized for video search engines).
-- summary_vi_note: short Vietnamese note describing what should appear on screen for editors.
+Per scene (exact counts): keywords×3, fallback_keywords×2, avoid_terms×4, storyblocks_search_queries×3, summary_vi_note (short VI).
 
-ALL keywords, fallback_keywords, avoid_terms, storyblocks_search_queries MUST be English.
+Scenes:${compactJson(payload)}
 
-Scenes:
-${JSON.stringify(payload)}
-
-Return ONLY valid JSON:
-{"scenes":[{"scene_index":0,"keywords":["..."],"fallback_keywords":["..."],"avoid_terms":["..."],"storyblocks_search_queries":["..."],"summary_vi_note":"..."}]}
-}`;
+{"scenes":[{"scene_index":0,"keywords":[],"fallback_keywords":[],"avoid_terms":[],"storyblocks_search_queries":[],"summary_vi_note":""}]}`;
 }
 
 export function parseKeywordPlans(
@@ -639,12 +615,12 @@ export function parseKeywordPlans(
     const row = list.find(
       (x) => typeof x?.scene_index === "number" && x.scene_index === i,
     ) ?? list[i];
-    const keywords = uniqueEnglishList(row?.keywords, 5);
-    const fallback_keywords = uniqueEnglishList(row?.fallback_keywords, 4);
-    const avoid_terms = uniqueEnglishList(row?.avoid_terms, 8);
+    const keywords = uniqueEnglishList(row?.keywords, 3);
+    const fallback_keywords = uniqueEnglishList(row?.fallback_keywords, 2);
+    const avoid_terms = uniqueEnglishList(row?.avoid_terms, 4);
     const storyblocks_search_queries = uniqueEnglishList(
       row?.storyblocks_search_queries,
-      5,
+      3,
     );
     const summary_vi_note =
       typeof row?.summary_vi_note === "string"

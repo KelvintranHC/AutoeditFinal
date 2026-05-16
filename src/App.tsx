@@ -70,6 +70,7 @@ import {
   parseKeywordPlans,
   rankStockVideos,
 } from "./scenePlanning";
+import { buildGeminiJsonConfig } from "./geminiConfig";
 
 /** AI Studio: gemini-2.0-flash trả 404 với key/user mới — dùng 2.5.x làm mặc định. */
 const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
@@ -1363,10 +1364,7 @@ export default function App() {
         const beatsRes = await ai.models.generateContent({
           model: config.analysisModel,
           contents: [{ role: "user", parts: [{ text: beatsPrompt }] }],
-          config: {
-            responseMimeType: "application/json",
-            maxOutputTokens: 8192,
-          },
+          config: buildGeminiJsonConfig("meaning_beats"),
         });
 
         if (beatsRes.usageMetadata) {
@@ -1414,10 +1412,7 @@ export default function App() {
         const kwRes = await ai.models.generateContent({
           model: config.analysisModel,
           contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
-          config: {
-            responseMimeType: "application/json",
-            maxOutputTokens: 8192,
-          },
+          config: buildGeminiJsonConfig("scene_keywords"),
         });
 
         if (kwRes.usageMetadata) {
@@ -1512,10 +1507,7 @@ Văn bản: ${script}`;
             const result = await ai.models.generateContent({
               model: config.analysisModel,
               contents: [{ role: "user", parts: [{ text: prompt }] }],
-              config: { 
-                responseMimeType: "application/json",
-                maxOutputTokens: 8192
-              },
+              config: buildGeminiJsonConfig("keyword_generation"),
             });
 
             const resultText = result.text;
@@ -3432,7 +3424,10 @@ Văn bản: ${script}`;
                       className="w-full bg-white/5 border border-white/10 rounded-lg p-3 text-sm outline-none focus:border-indigo-500/50 transition-colors text-slate-100"
                     >
                       <option value="gemini-2.5-flash">
-                        Gemini 2.5 Flash (khuyến nghị)
+                        Gemini 2.5 Flash (cân bằng)
+                      </option>
+                      <option value="gemini-2.5-flash-lite">
+                        Gemini 2.5 Flash Lite (ít token, khuyến nghị)
                       </option>
                       <option value="gemini-2.5-pro">
                         Gemini 2.5 Pro (ngữ cảnh sâu)
