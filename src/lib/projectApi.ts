@@ -61,6 +61,7 @@ export type ProjectPatch = Partial<
     | "mergeDriveViewUrl"
     | "mergeDriveDirectUrl"
     | "status"
+    | "tokenUsageJson"
   >
 >;
 

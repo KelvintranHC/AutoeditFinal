@@ -110,6 +110,14 @@ export function registerProjectRoutes(app: Express) {
     if (patch.status === "editing" || patch.status === "completed") {
       allowed.status = patch.status;
     }
+    if (patch.tokenUsageJson !== undefined) {
+      allowed.tokenUsageJson =
+        patch.tokenUsageJson === null
+          ? null
+          : typeof patch.tokenUsageJson === "string"
+            ? patch.tokenUsageJson
+            : JSON.stringify(patch.tokenUsageJson);
+    }
     const updated = updateProject(req.params.projectId, allowed);
     if (!updated) {
       return res.status(404).json({ error: "Project không tồn tại." });

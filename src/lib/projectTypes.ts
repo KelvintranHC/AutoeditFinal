@@ -16,6 +16,8 @@ export interface Project {
   mergeDriveDirectUrl?: string | null;
   /** `editing` = đang làm; `completed` = merge final video thành công */
   status?: ProjectStatus;
+  /** JSON ProjectTokenUsageLog — lịch sử token theo bước. */
+  tokenUsageJson?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -56,6 +58,9 @@ export interface UserAppConfig {
   storyblocksProxies: string;
   storyblocksCookies: string;
   driveAccessToken: string;
+  tokenUsdToVnd?: number;
+  tokenModelPricingJson?: string;
+  tokenStorePromptDetails?: boolean;
 }
 
 /** Legacy localStorage key — chỉ dùng khi migrate một lần. */

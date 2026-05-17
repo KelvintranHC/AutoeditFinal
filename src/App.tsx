@@ -29,6 +29,8 @@ import {
   Palette,
   GitMerge,
   Sparkles,
+  ScanSearch,
+  Square,
 } from "lucide-react";
 import * as motion from "motion/react-client";
 import { GoogleGenAI, Type } from "@google/genai";
@@ -53,6 +55,20 @@ import { Toaster, toast } from "react-hot-toast";
 // Global variables managed in component
 
 import { AutomationDownloader } from "./components/AutomationDownloader";
+import { TokenUsagePanel } from "./components/TokenUsagePanel";
+import {
+  appendTokenAttempt,
+  buildTokenAttempt,
+  emptyTokenUsageLog,
+  parseTokenSettingsFromConfig,
+  parseTokenUsageLog,
+  recordLocalProcessingStep,
+  tokenSettingsToConfigFields,
+  truncateForStorage,
+  type ProjectTokenUsageLog,
+  type TokenStepId,
+  type TokenUsageSettings,
+} from "./lib/tokenUsage";
 import {
   DEFAULT_PACING_PROFILE,
   PACING_TOTAL_CLIPS_ABSOLUTE_MAX,
@@ -60,6 +76,7 @@ import {
   clampTotalClipsRange,
   normalizePacingProfile,
   type PacingProfile,
+  aggregateSubtitleBlocksIntoSentences,
   blocksToSubtitleBlocks,
   buildMeaningBeatsPrompt,
   buildSceneKeywordsPrompt,
@@ -96,6 +113,7 @@ import {
   saveUserConfigApi,
   updateProjectApi,
 } from "./lib/projectApi";
+import { mergeSrtCuesIntoSentenceBlocks } from "../lib/srtSentenceFormatting";
 import {
   type Project,
   type UserAppConfig,
@@ -173,6 +191,8 @@ interface Scene {
   /** Scene được gộp thủ công từ nhiều scene gốc */
   isMerged?: boolean;
   mergedFromIds?: number[];
+  /** Đã chạy quét Storyblocks ít nhất một lần */
+  stockScanned?: boolean;
 }
 
 // Cache for storyblocks
@@ -796,43 +816,12 @@ export default function App() {
   const [editingProjectTitle, setEditingProjectTitle] = useState("");
 
   const [script, setScript] = useState("");
-  const [tokenUsageByStage, setTokenUsageByStage] = useState<
-    Record<
-      string,
-      {
-        promptTokenCount: number;
-        candidatesTokenCount: number;
-        totalTokenCount: number;
-        thoughtsTokenCount: number;
-        cachedContentTokenCount: number;
-        toolUsePromptTokenCount: number;
-      }
-    >
-  >({});
-
-  const tokenUsage = React.useMemo(() => {
-    const keys = Object.keys(tokenUsageByStage);
-    if (keys.length === 0) return null;
-    const total = {
-      promptTokenCount: 0,
-      candidatesTokenCount: 0,
-      totalTokenCount: 0,
-      thoughtsTokenCount: 0,
-      cachedContentTokenCount: 0,
-      toolUsePromptTokenCount: 0,
-    };
-    keys.forEach((k) => {
-      const u = tokenUsageByStage[k];
-      total.promptTokenCount += u.promptTokenCount;
-      total.candidatesTokenCount += u.candidatesTokenCount;
-      total.totalTokenCount += u.totalTokenCount;
-      total.thoughtsTokenCount += u.thoughtsTokenCount;
-      total.cachedContentTokenCount += u.cachedContentTokenCount;
-      total.toolUsePromptTokenCount += u.toolUsePromptTokenCount;
-    });
-    return total;
-  }, [tokenUsageByStage]);
+  const [tokenUsageLog, setTokenUsageLog] = useState<ProjectTokenUsageLog>(
+    emptyTokenUsageLog(),
+  );
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isAutoScanning, setIsAutoScanning] = useState(false);
+  const scanCancelledRef = React.useRef(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [proxyLogs, setProxyLogs] = useState<ProxyLog[]>([]);
   const defaultAppConfig = (): UserAppConfig => ({
@@ -857,12 +846,117 @@ export default function App() {
     storyblocksProxies: (parsed.storyblocksProxies as string) || "",
     storyblocksCookies: (parsed.storyblocksCookies as string) || "",
     driveAccessToken: (parsed.driveAccessToken as string) || "",
+    tokenUsdToVnd:
+      typeof parsed.tokenUsdToVnd === "number" ? parsed.tokenUsdToVnd : undefined,
+    tokenModelPricingJson:
+      typeof parsed.tokenModelPricingJson === "string"
+        ? parsed.tokenModelPricingJson
+        : undefined,
+    tokenStorePromptDetails: Boolean(parsed.tokenStorePromptDetails),
   });
 
   const [config, setConfig] = useState<UserAppConfig>(defaultAppConfig);
   const [configReady, setConfigReady] = useState(false);
 
-  const [viewMode, setViewMode] = useState<"editor" | "downloader">("editor");
+  const tokenSettings = React.useMemo(
+    () =>
+      parseTokenSettingsFromConfig(
+        config as unknown as Record<string, unknown>,
+      ),
+    [config],
+  );
+
+  const persistTokenUsageLog = React.useCallback(
+    async (log: ProjectTokenUsageLog) => {
+      if (!selectedProjectId) return;
+      try {
+        const updated = await updateProjectApi(selectedProjectId, {
+          tokenUsageJson: JSON.stringify(log),
+        });
+        setProjects((prev) =>
+          prev.map((p) => (p.id === selectedProjectId ? updated : p)),
+        );
+      } catch (e) {
+        console.warn("[token] persist failed", e);
+      }
+    },
+    [selectedProjectId],
+  );
+
+  const recordGeminiStep = React.useCallback(
+    async <T extends { text?: string | null; usageMetadata?: unknown }>(
+      stepId: TokenStepId,
+      model: string,
+      fn: () => Promise<T>,
+      opts?: {
+        promptPreview?: string;
+        outputPreview?: string;
+      },
+    ): Promise<T> => {
+      const startedAt = new Date().toISOString();
+      const t0 = performance.now();
+      try {
+        const result = await fn();
+        const attempt = buildTokenAttempt({
+          model,
+          status: "success",
+          usageMetadata: result.usageMetadata,
+          startedAt,
+          endedAt: new Date().toISOString(),
+          durationMs: performance.now() - t0,
+          promptPreview: tokenSettings.storePromptDetails
+            ? opts?.promptPreview
+              ? truncateForStorage(opts.promptPreview)
+              : undefined
+            : undefined,
+          outputPreview: tokenSettings.storePromptDetails
+            ? opts?.outputPreview
+              ? truncateForStorage(opts.outputPreview)
+              : result.text
+                ? truncateForStorage(result.text, 4000)
+                : undefined
+            : undefined,
+          pricing: tokenSettings.modelPricing,
+          usdToVndRate: tokenSettings.usdToVndRate,
+        });
+        setTokenUsageLog((prev) => {
+          const next = appendTokenAttempt(prev, stepId, attempt);
+          void persistTokenUsageLog(next);
+          return next;
+        });
+        return result;
+      } catch (err: unknown) {
+        const message =
+          err instanceof Error ? err.message : String(err ?? "Unknown error");
+        const attempt = buildTokenAttempt({
+          model,
+          status: "failed",
+          startedAt,
+          endedAt: new Date().toISOString(),
+          durationMs: performance.now() - t0,
+          error: message,
+          promptPreview: tokenSettings.storePromptDetails
+            ? opts?.promptPreview
+              ? truncateForStorage(opts.promptPreview)
+              : undefined
+            : undefined,
+          pricing: tokenSettings.modelPricing,
+          usdToVndRate: tokenSettings.usdToVndRate,
+        });
+        setTokenUsageLog((prev) => {
+          const next = appendTokenAttempt(prev, stepId, attempt);
+          void persistTokenUsageLog(next);
+          return next;
+        });
+        throw err;
+      }
+    },
+    [tokenSettings, persistTokenUsageLog],
+  );
+
+  const [viewMode, setViewMode] = useState<"editor" | "token" | "downloader">(
+    "editor",
+  );
   const [downloadJobs, setDownloadJobs] = useState<any[]>([]);
   const [mergeJobId, setMergeJobId] = useState<string | null>(null);
 
@@ -1002,6 +1096,8 @@ export default function App() {
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [uploadedAudioFile, setUploadedAudioFile] = useState<File | null>(null);
   const [scenes, setScenes] = useState<Scene[]>([]);
+  const scenesRef = React.useRef(scenes);
+  scenesRef.current = scenes;
   const [sceneMergeSelection, setSceneMergeSelection] = useState<number[]>(
     [],
   );
@@ -1053,36 +1149,42 @@ export default function App() {
             );
           }
           const base64Data = (reader.result as string).split(",")[1];
-          const result = await ai.models.generateContent({
-            model: config.transcriptionModel,
-            contents: [
-              {
-                role: "user",
-                parts: [
+          const transcribePrompt = `Lắng nghe file âm thanh và tạo file SRT chuẩn.
+
+QUY TẮC BẮT BUỘC:
+- Mỗi subtitle block phải kết thúc khi một CÂU HOÀN CHỈNH kết thúc (dấu . ? ! … hoặc ...).
+- KHÔNG chia block theo cố định vài giây, theo nhịp thở, hay theo chunk xử lý — chỉ chia tại dấu kết thúc câu.
+- Nếu một câu dài trải qua nhiều nhịp nói, gộp vào MỘT block cho đến khi hết câu.
+- Timestamp: thời gian bắt đầu = lúc bắt đầu câu; thời gian kết thúc = lúc kết thúc câu (không cắt giữa câu).
+- Giữ nguyên ngôn ngữ lời thoại (Đức, Việt, Anh, v.v.).
+
+Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), không giải thích thêm.`;
+
+          const result = await recordGeminiStep(
+            "mp3_to_srt",
+            config.transcriptionModel,
+            () =>
+              ai!.models.generateContent({
+                model: config.transcriptionModel,
+                contents: [
                   {
-                    inlineData: {
-                      mimeType: file.type || "audio/mp3",
-                      data: base64Data,
-                    },
-                  },
-                  {
-                    text: "Lắng nghe file âm thanh này và tạo transcript dưới định dạng chuẩn SRT. Trả về đúng định dạng SRT dài chi tiết với phân giải timestamp chính xác. Chỉ trả về text chuẩn của định dạng SRT duy nhất, không giải thích gì thêm.",
+                    role: "user",
+                    parts: [
+                      {
+                        inlineData: {
+                          mimeType: file.type || "audio/mp3",
+                          data: base64Data,
+                        },
+                      },
+                      { text: transcribePrompt },
+                    ],
                   },
                 ],
-              },
-            ],
-          });
+              }),
+            { promptPreview: transcribePrompt },
+          );
 
-          const text = result.text;
-
-          if (result.usageMetadata) {
-            setTokenUsageByStage((prev) => ({
-              ...prev,
-              transcribe: parseUsageMetadata(result.usageMetadata),
-            }));
-          }
-
-          resolve(text || "");
+          resolve(result.text || "");
         } catch (err: any) {
           reject(
             new Error("Lỗi khi dùng AI tạo transcript: " + formatAIError(err)),
@@ -1103,11 +1205,22 @@ export default function App() {
     });
 
     try {
-      const srtContent = await transcribeAudio(file);
+      const rawSrt = await transcribeAudio(file);
 
-      if (!srtContent || srtContent.length < 10) {
+      if (!rawSrt || rawSrt.length < 10) {
         throw new Error("Không thể trích xuất phụ đề từ âm thanh này.");
       }
+
+      const tNorm0 = performance.now();
+      const srtContent = mergeSrtCuesIntoSentenceBlocks(rawSrt);
+      setTokenUsageLog((prev) => {
+        const next = recordLocalProcessingStep(prev, "srt_sentence_normalize", {
+          note: "Gom cue SRT theo câu hoàn chỉnh (local)",
+          durationMs: performance.now() - tNorm0,
+        });
+        void persistTokenUsageLog(next);
+        return next;
+      });
 
       setUploadedAudioFile(file);
       setScript(srtContent);
@@ -1271,6 +1384,10 @@ export default function App() {
       }
       setDownloadUrl(proj.downloadUrl || null);
       setSceneMergeSelection([]);
+      setTokenUsageLog({
+        ...parseTokenUsageLog(proj.tokenUsageJson),
+        projectId: proj.id,
+      });
     } else {
       setScript("");
       setScenes([]);
@@ -1279,6 +1396,7 @@ export default function App() {
       setPacingProfile({ ...DEFAULT_PACING_PROFILE });
       setAudioUrl(null);
       setDownloadUrl(null);
+      setTokenUsageLog(emptyTokenUsageLog());
     }
   }, [selectedProjectId, projects]);
 
@@ -1495,24 +1613,29 @@ export default function App() {
       const viPrompt = buildVietnameseSceneNotesPrompt([draft]);
 
       const [kwRes, viRes] = await Promise.all([
-        ai.models.generateContent({
-          model: config.analysisModel,
-          contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
-          config: buildGeminiJsonConfig("scene_keywords"),
-        }),
-        ai.models.generateContent({
-          model: config.analysisModel,
-          contents: [{ role: "user", parts: [{ text: viPrompt }] }],
-          config: buildGeminiJsonConfig("scene_summaries_vi"),
-        }),
+        recordGeminiStep(
+          "regenerate_keywords_en",
+          config.analysisModel,
+          () =>
+            ai.models.generateContent({
+              model: config.analysisModel,
+              contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
+              config: buildGeminiJsonConfig("scene_keywords"),
+            }),
+          { promptPreview: kwPrompt },
+        ),
+        recordGeminiStep(
+          "scene_summaries_vi",
+          config.analysisModel,
+          () =>
+            ai.models.generateContent({
+              model: config.analysisModel,
+              contents: [{ role: "user", parts: [{ text: viPrompt }] }],
+              config: buildGeminiJsonConfig("scene_summaries_vi"),
+            }),
+          { promptPreview: viPrompt },
+        ),
       ]);
-
-      if (kwRes.usageMetadata) {
-        setTokenUsageByStage((prev) => ({
-          ...prev,
-          scene_keywords: parseUsageMetadata(kwRes.usageMetadata),
-        }));
-      }
 
       let plans;
       try {
@@ -1545,7 +1668,8 @@ export default function App() {
           videos: [],
           selectedVideoIdx: 0,
           selectedVideos: [],
-          loadingVideos: true,
+          loadingVideos: false,
+          stockScanned: false,
           srtContext: {
             ...copy[sceneIdx].srtContext,
             startTime:
@@ -1565,14 +1689,8 @@ export default function App() {
       setIsDirty(true);
 
       toast.dismiss(toastId);
-      toast.success(`Keywords EN: «${primary}» — đang tìm Storyblocks...`);
-
-      await fetchSceneVideos(
-        primary,
-        sceneIdx,
-        scene.text,
-        scene.srtContext?.duration ?? draft.durationSec,
-        { choicesLimit: pacingProfile.storyblocksChoicesPerKeyword },
+      toast.success(
+        `Keywords EN: «${primary}» — bấm Auto Scan để tìm clip Storyblocks.`,
       );
     } catch (err: any) {
       console.error("Regenerate keywords:", err);
@@ -1605,29 +1723,36 @@ export default function App() {
     }
 
     setIsProcessing(true);
-    setTokenUsageByStage({});
     setError(null);
     try {
       let initialScenes: Scene[] = [];
 
       if (isSRT) {
         toast.loading("Đang phân tích SRT bằng code...", { id: "analyze-srt" });
-        const blocks = parseSRT(script);
-        if (blocks.length === 0)
+        const srtCues = parseSRT(script);
+        if (srtCues.length === 0)
           throw new Error("File SRT không hợp lệ hoặc rỗng.");
 
         if (!ai) throw new Error("Gemini API Key chưa được thiết lập.");
 
-        const linePayload = blocks.map((b, idx) => ({
+        const cueBlocks = blocksToSubtitleBlocks(srtCues);
+        toast.loading("Gom câu hoàn chỉnh từ phụ đề (không theo xuống dòng)...", {
+          id: "analyze-srt",
+        });
+        const sentenceBlocks = aggregateSubtitleBlocksIntoSentences(cueBlocks);
+        if (sentenceBlocks.length === 0) {
+          throw new Error("Không tách được câu từ file SRT.");
+        }
+
+        const linePayload = sentenceBlocks.map((b, idx) => ({
           index: idx,
           text: b.text,
           start_sec: b.startTime,
           end_sec: b.endTime,
         }));
-        const subBlocks = blocksToSubtitleBlocks(blocks);
         const langHint = detectSubtitleLangHint(linePayload);
 
-        toast.loading("Gemini — Meaning beats (lớp nội dung)...", {
+        toast.loading("Gemini — Meaning beats (gom câu thành phân cảnh)...", {
           id: "analyze-srt",
         });
 
@@ -1636,18 +1761,17 @@ export default function App() {
           visualKeywordDirection,
           langHint,
         );
-        const beatsRes = await ai.models.generateContent({
-          model: config.analysisModel,
-          contents: [{ role: "user", parts: [{ text: beatsPrompt }] }],
-          config: buildGeminiJsonConfig("meaning_beats"),
-        });
-
-        if (beatsRes.usageMetadata) {
-          setTokenUsageByStage((prev) => ({
-            ...prev,
-            meaning_beats: parseUsageMetadata(beatsRes.usageMetadata),
-          }));
-        }
+        const beatsRes = await recordGeminiStep(
+          "meaning_beats",
+          config.analysisModel,
+          () =>
+            ai!.models.generateContent({
+              model: config.analysisModel,
+              contents: [{ role: "user", parts: [{ text: beatsPrompt }] }],
+              config: buildGeminiJsonConfig("meaning_beats"),
+            }),
+          { promptPreview: beatsPrompt },
+        );
 
         let meaningBeats: any[] = [];
         try {
@@ -1664,11 +1788,11 @@ export default function App() {
         }
 
         if (meaningBeats.length === 0) {
-          meaningBeats = ruleBasedMeaningBeats(subBlocks, 4);
+          meaningBeats = ruleBasedMeaningBeats(sentenceBlocks, 2);
           toast(
             langHint === "de"
-              ? "SRT tiếng Đức — gom phân cảnh theo luật (Gemini beats trống)."
-              : "Gom phân cảnh theo luật (Gemini beats trống).",
+              ? "SRT tiếng Đức — gom phân cảnh theo câu (Gemini beats trống)."
+              : "Gom phân cảnh theo câu hoàn chỉnh (Gemini beats trống).",
             { id: "analyze-srt", icon: "ℹ️" },
           );
         }
@@ -1679,7 +1803,7 @@ export default function App() {
 
         const drafts = mergeMeaningBeatsToVisualScenes(
           meaningBeats,
-          subBlocks,
+          sentenceBlocks,
           pacingProfile,
         );
 
@@ -1699,30 +1823,29 @@ export default function App() {
         const viPrompt = buildVietnameseSceneNotesPrompt(drafts);
 
         const [kwRes, viRes] = await Promise.all([
-          ai.models.generateContent({
-            model: config.analysisModel,
-            contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
-            config: buildGeminiJsonConfig("scene_keywords"),
-          }),
-          ai.models.generateContent({
-            model: config.analysisModel,
-            contents: [{ role: "user", parts: [{ text: viPrompt }] }],
-            config: buildGeminiJsonConfig("scene_summaries_vi"),
-          }),
+          recordGeminiStep(
+            "scene_keywords",
+            config.analysisModel,
+            () =>
+              ai!.models.generateContent({
+                model: config.analysisModel,
+                contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
+                config: buildGeminiJsonConfig("scene_keywords"),
+              }),
+            { promptPreview: kwPrompt },
+          ),
+          recordGeminiStep(
+            "scene_summaries_vi",
+            config.analysisModel,
+            () =>
+              ai!.models.generateContent({
+                model: config.analysisModel,
+                contents: [{ role: "user", parts: [{ text: viPrompt }] }],
+                config: buildGeminiJsonConfig("scene_summaries_vi"),
+              }),
+            { promptPreview: viPrompt },
+          ),
         ]);
-
-        if (kwRes.usageMetadata) {
-          setTokenUsageByStage((prev) => ({
-            ...prev,
-            scene_keywords: parseUsageMetadata(kwRes.usageMetadata),
-          }));
-        }
-        if (viRes.usageMetadata) {
-          setTokenUsageByStage((prev) => ({
-            ...prev,
-            scene_summaries_vi: parseUsageMetadata(viRes.usageMetadata),
-          }));
-        }
 
         let vietnameseNotes: string[] = [];
         try {
@@ -1772,7 +1895,7 @@ export default function App() {
             videos: [],
             selectedVideoIdx: 0,
             selectedVideos: [],
-            loadingVideos: true,
+            loadingVideos: false,
             srtContext: {
               startTime: formatSRTTime(d.startTime),
               endTime: formatSRTTime(d.endTime),
@@ -1786,7 +1909,7 @@ export default function App() {
           };
         });
 
-        const integrity = validateSrtSceneTextIntegrity(subBlocks, drafts);
+        const integrity = validateSrtSceneTextIntegrity(sentenceBlocks, drafts);
         if (!integrity.ok) {
           console.error(
             "[SRT] Text integrity failed",
@@ -1804,7 +1927,7 @@ export default function App() {
 
         toast.dismiss("analyze-srt");
         toast.success(
-          `Đã tạo ${initialScenes.length} phân cảnh (Scene Planning + Storyblocks EN).`,
+          `Đã tạo ${initialScenes.length} phân cảnh — duyệt, gộp nếu cần, rồi bấm Auto Scan.`,
         );
       } else {
         let aiScenes: any[] = [];
@@ -1831,20 +1954,19 @@ Chỉ trả về JSON: {"scenes": [{"id": 1, "text": "...", "keyword": "..."}]}
 Văn bản: ${script}`;
 
           try {
-            const result = await ai.models.generateContent({
-              model: config.analysisModel,
-              contents: [{ role: "user", parts: [{ text: prompt }] }],
-              config: buildGeminiJsonConfig("keyword_generation"),
-            });
+            const result = await recordGeminiStep(
+              "keyword_generation",
+              config.analysisModel,
+              () =>
+                ai!.models.generateContent({
+                  model: config.analysisModel,
+                  contents: [{ role: "user", parts: [{ text: prompt }] }],
+                  config: buildGeminiJsonConfig("keyword_generation"),
+                }),
+              { promptPreview: prompt },
+            );
 
             const resultText = result.text;
-
-            if (result.usageMetadata) {
-              setTokenUsageByStage((prev) => ({
-                ...prev,
-                keyword_generation: parseUsageMetadata(result.usageMetadata),
-              }));
-            }
 
             const cleanResultText = (resultText || "{}")
               .replace(/^```(?:json)?\s*/i, "")
@@ -1924,26 +2046,28 @@ Văn bản: ${script}`;
       setScenes(initialScenes);
       setIsDirty(true);
       toast.dismiss("analyze-srt");
-      
-      // Process sequentially to avoid WAF block from too many concurrent puppeteer instances
-      for (let i = 0; i < initialScenes.length; i++) {
-        const scene = initialScenes[i];
-        if (scene.keyword) {
-          await fetchSceneVideos(
-            scene.keyword,
-            i,
-            scene.text,
-            scene.srtContext?.duration,
-            {
-              choicesLimit: pacingProfile.storyblocksChoicesPerKeyword,
-            },
-          );
-        } else {
-          setScenes((prev) => {
-            const updated = [...prev];
-            updated[i] = { ...updated[i], loadingVideos: false };
-            return updated;
-          });
+
+      // Plain keyword list: vẫn quét Storyblocks ngay. SRT: chỉ preview — user bấm Auto Scan.
+      if (!isSRT) {
+        for (let i = 0; i < initialScenes.length; i++) {
+          const scene = initialScenes[i];
+          if (scene.keyword) {
+            await fetchSceneVideos(
+              scene.keyword,
+              i,
+              scene.text,
+              scene.srtContext?.duration,
+              {
+                choicesLimit: pacingProfile.storyblocksChoicesPerKeyword,
+              },
+            );
+          } else {
+            setScenes((prev) => {
+              const updated = [...prev];
+              updated[i] = { ...updated[i], loadingVideos: false };
+              return updated;
+            });
+          }
         }
       }
     } catch (err: any) {
@@ -1955,13 +2079,90 @@ Văn bản: ${script}`;
     }
   };
 
+  const handleStopScanning = () => {
+    if (!isAutoScanning) return;
+    scanCancelledRef.current = true;
+    setIsAutoScanning(false);
+    setScenes((prev) =>
+      prev.map((s) =>
+        s.loadingVideos ? { ...s, loadingVideos: false } : s,
+      ),
+    );
+    toast("Đã dừng quét Storyblocks.", { icon: "⏹" });
+  };
+
+  const handleAutoScan = async () => {
+    if (scenes.length === 0 || isAutoScanning || isProcessing) return;
+    scanCancelledRef.current = false;
+    setIsAutoScanning(true);
+    const toastId = "auto-scan";
+    toast.loading("Đang quét Storyblocks theo từng phân cảnh...", {
+      id: toastId,
+    });
+
+    const list = scenesRef.current;
+    let scanned = 0;
+    try {
+      for (let i = 0; i < list.length; i++) {
+        if (scanCancelledRef.current) break;
+        const scene = list[i];
+        if (!scene.keyword?.trim()) {
+          setScenes((prev) => {
+            const updated = [...prev];
+            if (updated[i]) {
+              updated[i] = { ...updated[i], loadingVideos: false };
+            }
+            return updated;
+          });
+          continue;
+        }
+        setScenes((prev) => {
+          const updated = [...prev];
+          if (updated[i]) {
+            updated[i] = { ...updated[i], loadingVideos: true };
+          }
+          return updated;
+        });
+        await fetchSceneVideos(
+          scene.keyword,
+          i,
+          scene.text,
+          scene.srtContext?.duration,
+          {
+            choicesLimit: pacingProfile.storyblocksChoicesPerKeyword,
+            shouldAbort: () => scanCancelledRef.current,
+          },
+        );
+        if (scanCancelledRef.current) break;
+        scanned++;
+      }
+      toast.dismiss(toastId);
+      if (scanCancelledRef.current) {
+        toast("Đã dừng quét Storyblocks.", { icon: "⏹" });
+      } else {
+        toast.success(
+          `Đã quét xong ${scanned}/${list.length} phân cảnh trên Storyblocks.`,
+        );
+      }
+    } catch (err: any) {
+      toast.dismiss(toastId);
+      if (!scanCancelledRef.current) {
+        toast.error(formatAIError(err));
+      }
+    } finally {
+      setIsAutoScanning(false);
+      scanCancelledRef.current = false;
+    }
+  };
+
   const fetchSceneVideos = async (
     keyword: string,
     index: number,
     sceneText: string,
     sceneDuration?: number,
-    fetchOpts?: { choicesLimit?: number },
+    fetchOpts?: { choicesLimit?: number; shouldAbort?: () => boolean },
   ) => {
+    if (fetchOpts?.shouldAbort?.()) return;
     try {
       const normalizedKeyword = keyword.trim().toLowerCase();
       let allVideos: VideoResult[] = [];
@@ -1987,6 +2188,7 @@ Văn bản: ${script}`;
         });
 
         const data = await handleApiResponse(res, "scrape");
+        if (fetchOpts?.shouldAbort?.()) return;
         allVideos = data.videos || [];
         searchCache.set(normalizedKeyword, allVideos);
 
@@ -2026,6 +2228,8 @@ Văn bản: ${script}`;
         bestIdx = 0;
       }
 
+      if (fetchOpts?.shouldAbort?.()) return;
+
       setScenes((prev) => {
         const updated = [...prev];
         if (updated[index] && updated[index].keyword === keyword) {
@@ -2033,6 +2237,7 @@ Văn bản: ${script}`;
             ...updated[index],
             videos: displayVideos,
             loadingVideos: false,
+            stockScanned: true,
             selectedVideoIdx: bestIdx,
             selectedVideos: selectedSegments,
           };
@@ -2041,6 +2246,7 @@ Văn bản: ${script}`;
       });
       setIsDirty(true);
     } catch (error: any) {
+      if (fetchOpts?.shouldAbort?.()) return;
       console.error("Error fetching videos:", error);
       const msg =
         error.message === "Failed to fetch"
@@ -2050,7 +2256,11 @@ Văn bản: ${script}`;
       setScenes((prev) => {
         const updated = [...prev];
         if (updated[index] && updated[index].keyword === keyword) {
-          updated[index] = { ...updated[index], loadingVideos: false };
+          updated[index] = {
+            ...updated[index],
+            loadingVideos: false,
+            stockScanned: true,
+          };
         }
         return updated;
       });
@@ -2306,6 +2516,12 @@ Văn bản: ${script}`;
               Studio
             </button>
             <button
+              onClick={() => setViewMode("token")}
+              className={`px-3 py-1 text-[10px] font-bold uppercase tracking-wider rounded-md transition-all ${viewMode === "token" ? "bg-amber-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"}`}
+            >
+              Token
+            </button>
+            <button
               onClick={() => setViewMode("downloader")}
               className={`px-3 py-1 text-[10px] font-bold uppercase tracking-wider rounded-md transition-all ${viewMode === "downloader" ? "bg-emerald-600 text-white shadow-lg" : "text-slate-500 hover:text-slate-300"}`}
             >
@@ -2484,7 +2700,42 @@ Văn bản: ${script}`;
           </aside>
 
         {/* Main Content Area */}
-        {viewMode === "editor" ? (
+        {viewMode === "token" ? (
+          <TokenUsagePanel
+            projectTitle={
+              projects.find((p) => p.id === selectedProjectId)?.title
+            }
+            log={tokenUsageLog}
+            settings={tokenSettings}
+            onSettingsChange={(next) => {
+              setConfig((prev) => ({
+                ...prev,
+                ...tokenSettingsToConfigFields(next),
+              }));
+            }}
+            onSaveSettings={async () => {
+              try {
+                await saveUserConfigApi({
+                  ...config,
+                  ...tokenSettingsToConfigFields(tokenSettings),
+                });
+                toast.success("Đã lưu cấu hình token");
+              } catch {
+                toast.error("Lưu cấu hình token thất bại");
+              }
+            }}
+            onClearLog={
+              selectedProjectId
+                ? async () => {
+                    const empty = emptyTokenUsageLog(selectedProjectId);
+                    setTokenUsageLog(empty);
+                    await persistTokenUsageLog(empty);
+                    toast.success("Đã xóa log token của dự án");
+                  }
+                : undefined
+            }
+          />
+        ) : viewMode === "editor" ? (
           <>
             {/* Mobile Tabs */}
             <div className="md:hidden absolute top-0 left-0 right-0 h-10 border-b border-white/10 bg-black/40 flex z-20">
@@ -2599,149 +2850,15 @@ Văn bản: ${script}`;
                 <>Phân tích Keywords & Tìm Video</>
               )}
             </button>
-            {tokenUsage && (
-              <div className="mt-4 bg-white/5 border border-white/10 rounded-lg p-3 text-[11px] text-slate-300 font-mono shadow-sm">
-                <div className="flex justify-between items-center mb-3">
-                  <span className="uppercase tracking-widest text-slate-400 font-bold text-[10px]">
-                    Token Breakdown
-                  </span>
-                  <span className="text-indigo-400 font-bold text-sm">
-                    {tokenUsage.totalTokenCount.toLocaleString()} t
-                  </span>
-                </div>
-
-                <div className="grid grid-cols-2 gap-x-4 gap-y-3 mb-3">
-                  <div className="flex flex-col relative group">
-                    <span className="text-slate-500 uppercase tracking-wider text-[9px] font-bold">
-                      Prompt
-                    </span>
-                    <span className="text-white font-medium">
-                      {tokenUsage.promptTokenCount.toLocaleString()}
-                    </span>
-                  </div>
-                  <div className="flex flex-col relative group">
-                    <span className="text-slate-500 uppercase tracking-wider text-[9px] font-bold">
-                      Response
-                    </span>
-                    <span className="text-white font-medium">
-                      {tokenUsage.candidatesTokenCount.toLocaleString()}
-                    </span>
-                  </div>
-                  {tokenUsage.thoughtsTokenCount > 0 && (
-                    <div className="flex flex-col relative group bg-indigo-500/5 p-1 rounded">
-                      <span className="text-indigo-400/70 uppercase tracking-wider text-[9px] font-bold">
-                        Thinking
-                      </span>
-                      <span className="text-indigo-300 font-medium">
-                        {tokenUsage.thoughtsTokenCount.toLocaleString()}
-                      </span>
-                    </div>
-                  )}
-                  {tokenUsage.cachedContentTokenCount > 0 && (
-                    <div className="flex flex-col relative group">
-                      <span className="text-slate-500 uppercase tracking-wider text-[9px] font-bold">
-                        Cached
-                      </span>
-                      <span className="text-white font-medium">
-                        {tokenUsage.cachedContentTokenCount.toLocaleString()}
-                      </span>
-                    </div>
-                  )}
-                  <div className="flex flex-col relative group">
-                    <span className="text-slate-500 uppercase tracking-wider text-[9px] font-bold">
-                      Tool / System
-                    </span>
-                    <span className="text-white font-medium">
-                      {tokenUsage.toolUsePromptTokenCount.toLocaleString()}
-                    </span>
-                    <div className="absolute bottom-full left-0 mb-1 hidden group-hover:block bg-slate-800 text-white p-2 rounded text-[10px] z-50 w-48 shadow-lg border border-slate-700">
-                      Token được dùng cho hướng dẫn hệ thống / gọi hàm.
-                    </div>
-                  </div>
-
-                  {(() => {
-                    const other =
-                      tokenUsage.totalTokenCount -
-                      tokenUsage.promptTokenCount -
-                      tokenUsage.candidatesTokenCount -
-                      tokenUsage.thoughtsTokenCount -
-                      tokenUsage.cachedContentTokenCount -
-                      tokenUsage.toolUsePromptTokenCount;
-                    return (
-                      <div className="flex flex-col relative group">
-                        <span className="text-slate-500 uppercase tracking-wider text-[9px] font-bold">
-                          Other / Hidden
-                        </span>
-                        <span className="text-rose-400 font-medium">
-                          {other.toLocaleString()}
-                        </span>
-                        <div className="absolute bottom-full right-0 mb-1 hidden group-hover:block bg-slate-800 text-white p-2 rounded text-[10px] z-50 w-48 shadow-lg border border-slate-700">
-                          Lượng token chênh lệch do system instruction, schema
-                          nội bộ hoặc padding billing.
-                        </div>
-                      </div>
-                    );
-                  })()}
-                </div>
-
-                {(() => {
-                  const other =
-                    tokenUsage.totalTokenCount -
-                    tokenUsage.promptTokenCount -
-                    tokenUsage.candidatesTokenCount -
-                    tokenUsage.thoughtsTokenCount -
-                    tokenUsage.cachedContentTokenCount -
-                    tokenUsage.toolUsePromptTokenCount;
-                  if (
-                    other > 0 ||
-                    tokenUsage.totalTokenCount !==
-                      tokenUsage.promptTokenCount +
-                        tokenUsage.candidatesTokenCount
-                  ) {
-                    return (
-                      <div className="mt-2 mb-2 text-[10px] text-orange-300 text-center opacity-80 italic leading-snug border-t border-white/5 pt-2">
-                        * Total token count ({tokenUsage.totalTokenCount}) bao
-                        gồm các thành phần ẩn (thinking, cache, metadata) -
-                        Không chỉ là Input + Output.
-                      </div>
-                    );
-                  }
-                  return null;
-                })()}
-
-                <div className="mt-3 pt-3 border-t border-white/5">
-                  <span className="uppercase tracking-widest text-slate-500 font-bold text-[9px] mb-2 block">
-                    Tokens By Stage
-                  </span>
-                  <div className="space-y-1.5 flex flex-col">
-                    {Object.entries(tokenUsageByStage).map(
-                      ([stageName, usage]: [string, any]) => (
-                        <div
-                          key={stageName}
-                          className="flex justify-between items-center text-[10px]"
-                        >
-                          <span className="text-slate-400 font-medium truncate pr-2 capitalize">
-                            {stageName.replace(/_/g, " ")}
-                          </span>
-                          <div className="flex gap-2 shrink-0">
-                            <span
-                              className="text-slate-500"
-                              title="Thinking Tokens"
-                            >
-                              {usage.thoughtsTokenCount > 0 &&
-                                `(Think: ${usage.thoughtsTokenCount})`}
-                            </span>
-                            <span className="text-indigo-300/80 font-bold">
-                              {usage.totalTokenCount.toLocaleString()} t
-                            </span>
-                          </div>
-                        </div>
-                      ),
-                    )}
-                  </div>
-                </div>
-              </div>
-            )}
+            {tokenUsageLog.steps.length > 0 ? (
+              <button
+                type="button"
+                onClick={() => setViewMode("token")}
+                className="mt-3 w-full text-[10px] text-amber-400/90 hover:text-amber-300 border border-amber-500/20 rounded-lg py-2 bg-amber-500/5 transition-colors"
+              >
+                Xem chi tiết token &amp; chi phí → tab Token
+              </button>
+            ) : null}
           </div>
         </section>
 
@@ -2790,6 +2907,26 @@ Văn bản: ${script}`;
                       Bỏ chọn
                     </button>
                   )}
+                  {isAutoScanning ? (
+                    <button
+                      type="button"
+                      onClick={handleStopScanning}
+                      className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-red-600/20 text-red-300 hover:bg-red-600/35 border border-red-500/40 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-colors uppercase tracking-wider"
+                    >
+                      <Square size={10} className="md:w-3 md:h-3 fill-current" />
+                      Stop scanning
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={handleAutoScan}
+                      disabled={isProcessing}
+                      className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-emerald-600/20 text-emerald-300 hover:bg-emerald-600/35 border border-emerald-500/40 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-colors uppercase tracking-wider disabled:opacity-40"
+                    >
+                      <ScanSearch size={10} className="md:w-3 md:h-3" />
+                      Auto Scan
+                    </button>
+                  )}
                   <button
                     onClick={() => saveProjectState(script, scenes, true)}
                     disabled={isSaving}
@@ -2815,10 +2952,12 @@ Văn bản: ${script}`;
 
                 </>
               )}
-              {isProcessing && (
+              {(isProcessing || isAutoScanning) && (
                 <span className="flex items-center gap-1.5 text-[10px] bg-green-500/20 text-green-400 px-2 py-1 rounded-full border border-green-500/30">
-                  <div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse"></div>{" "}
-                  Browser Engine Active
+                  <motion.div className="w-1.5 h-1.5 rounded-full bg-green-400 animate-pulse"></motion.div>{" "}
+                  {isAutoScanning
+                    ? "Storyblocks scanning…"
+                    : "Browser Engine Active"}
                 </span>
               )}
             </div>
@@ -2888,15 +3027,26 @@ Văn bản: ${script}`;
                           ) : (
                             <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-500 p-2 text-center text-[9px] bg-black/40">
                               <Info size={16} className="mb-1 opacity-40" />
-                              No results found
-                              <a
-                                href={`https://www.storyblocks.com/video/search?searchTerm=${encodeURIComponent(scene.keyword)}`}
-                                target="_blank"
-                                rel="noreferrer"
-                                className="text-blue-400 hover:underline mt-1"
-                              >
-                                Try manual search
-                              </a>
+                              {!scene.stockScanned ? (
+                                <>
+                                  Chưa quét Storyblocks
+                                  <span className="text-slate-600 mt-0.5 block">
+                                    Bấm Auto Scan ở thanh Preview
+                                  </span>
+                                </>
+                              ) : (
+                                <>
+                                  No results found
+                                  <a
+                                    href={`https://www.storyblocks.com/video/search?searchTerm=${encodeURIComponent(scene.keyword)}`}
+                                    target="_blank"
+                                    rel="noreferrer"
+                                    className="text-blue-400 hover:underline mt-1"
+                                  >
+                                    Try manual search
+                                  </a>
+                                </>
+                              )}
                             </div>
                           )}
                         </div>
@@ -3107,7 +3257,7 @@ Văn bản: ${script}`;
           )}
         </section>
       </>
-    ) : (
+    ) : viewMode === "downloader" ? (
       <AutomationDownloader 
         projectId={selectedProjectId!}
         projectRecord={projects.find((p) => p.id === selectedProjectId) ?? null}
@@ -3128,7 +3278,7 @@ Văn bản: ${script}`;
           );
         }}
       />
-    )}
+    ) : null}
   </main>
 
       {/* Popup: Visual style & pacing (per project) */}

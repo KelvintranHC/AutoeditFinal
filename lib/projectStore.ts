@@ -21,6 +21,7 @@ export interface StoredProject {
   mergeDriveViewUrl?: string | null;
   mergeDriveDirectUrl?: string | null;
   status?: "editing" | "completed";
+  tokenUsageJson?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -48,6 +49,9 @@ export interface UserAppConfigPayload {
   storyblocksProxies: string;
   storyblocksCookies: string;
   driveAccessToken: string;
+  tokenUsdToVnd?: number;
+  tokenModelPricingJson?: string;
+  tokenStorePromptDetails?: boolean;
 }
 
 export interface StoredAppConfig {
@@ -158,6 +162,7 @@ export function updateProject(
       | "mergeDriveViewUrl"
       | "mergeDriveDirectUrl"
       | "status"
+      | "tokenUsageJson"
     >
   >,
 ): StoredProject | null {

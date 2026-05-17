@@ -7,7 +7,14 @@ export interface SubtitleBlock {
   startTime: number;
   endTime: number;
   text: string;
+  /** Cue SRT gốc (0-based) khi block là câu đã gom từ nhiều cue */
+  sourceCueStart?: number;
+  sourceCueEnd?: number;
 }
+
+/** Câu hoàn chỉnh: kết thúc bằng . ? ! … hoặc ... (không coi xuống dòng SRT là hết câu). */
+const COMPLETE_SENTENCE_HEAD_RE =
+  /^([\s\S]+?(?:\.{3}|[.!?…]+))(\s+|$)/;
 
 export interface MeaningBeat {
   start_line_index: number;
@@ -194,7 +201,9 @@ function mergeAdjacentSceneDrafts(
     text: blocks
       .slice(a.startLine, b.endLine + 1)
       .map((x) => x.text)
-      .join(" "),
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim(),
     summaryVi: [a.summaryVi, b.summaryVi].filter(Boolean).join(" · "),
     pacingZone: z,
     topics: [...a.topics, ...b.topics],
@@ -487,7 +496,9 @@ export function splitBlockRangeIntoVisualScenes(
     const text = blocks
       .slice(idx, endIdx + 1)
       .map((b) => b.text)
-      .join(" ");
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
     out.push({
       startLine: idx,
       endLine: endIdx,
@@ -515,7 +526,9 @@ function sceneTextFromBlockRange(
   return blocks
     .slice(lo, hi + 1)
     .map((b) => b.text)
-    .join(" ");
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** Đồng bộ scene với dải dòng SRT — text/timing luôn lấy từ blocks. */
@@ -785,7 +798,9 @@ export function mergeMeaningBeatsToVisualScenes(
     const text = blocks
       .slice(gStart, gEnd + 1)
       .map((b) => b.text)
-      .join(" ");
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim();
     const summaryVi =
       group.map((g) => g.summary_vi).filter(Boolean).join(" · ") ||
       text.slice(0, 200);
@@ -906,15 +921,16 @@ export function isGenericStockKeyword(k: string): boolean {
   return GENERIC_KEYWORD_RE.test(t);
 }
 
-/** Gom beat theo nhóm dòng khi Gemini meaning-beats thất bại. */
+/** Gom beat theo nhóm câu khi Gemini meaning-beats thất bại. */
 export function ruleBasedMeaningBeats(
   blocks: SubtitleBlock[],
-  maxLinesPerBeat = 4,
+  maxSentencesPerBeat = 2,
 ): MeaningBeat[] {
   if (!blocks.length) return [];
   const beats: MeaningBeat[] = [];
+  const span = Math.max(1, maxSentencesPerBeat);
   for (let i = 0; i < blocks.length; ) {
-    const end = Math.min(blocks.length - 1, i + Math.max(1, maxLinesPerBeat) - 1);
+    const end = Math.min(blocks.length - 1, i + span - 1);
     const text = blocks
       .slice(i, end + 1)
       .map((b) => b.text)
@@ -948,20 +964,20 @@ export function buildMeaningBeatsPrompt(
           ? "Input may be Vietnamese — summary may be Vietnamese; topic and suggested_visual_direction_en MUST be English."
           : "Subtitles may be ANY language (German, English, Vietnamese, etc.). Understand meaning in the source language.";
 
-  return `SRT analyst. Group 0-based lines into meaning beats. JSON only, no prose.
+  return `SRT analyst. Each row is one COMPLETE SENTENCE (SRT soft line breaks were merged; do NOT treat newline as sentence end). Group 0-based sentence indices into meaning beats. JSON only, no prose.
 ${langLine}
 
 Each beat:
-- start_line_index, end_line_index (0..${lastIdx})
+- start_line_index, end_line_index (0..${lastIdx}) — inclusive sentence indices
 - summary_vi: short Vietnamese summary of beat content (translate if source is not Vietnamese)
 - topic: REQUIRED 2-4 English words for stock video search (specific, not "general" or "b-roll")
 - importance: 1-5
 - suggested_visual_direction_en: REQUIRED short English shot idea (specific subject + action)
 
-Rules: cover every line once, no gaps/overlaps; never one beat for entire file if >5 lines or >25s; merge same idea only; split on topic/visual shift; first ~60s prefer smaller beats; each beat needs DISTINCT English topic when ideas differ.
+Rules: cover every sentence index once, no gaps/overlaps; NEVER split a single sentence across two beats; never one beat for entire file if >5 sentences or >25s; merge only related consecutive sentences; split on topic/visual shift; first ~60s prefer smaller beats; each beat needs DISTINCT English topic when ideas differ.
 Style hint: ${style || "none"}
 
-Lines:${compactJson(lines)}
+Sentences:${compactJson(lines)}
 
 {"meaning_beats":[{"start_line_index":0,"end_line_index":0,"summary_vi":"","topic":"","importance":3,"suggested_visual_direction_en":""}]}`;
 }
@@ -1476,6 +1492,84 @@ export function blocksToSubtitleBlocks(
     endTime: b.endTime,
     text: b.text,
   }));
+}
+
+type SentenceAccumMeta = {
+  sourceStart: number;
+  sourceEnd: number;
+  startTime: number;
+  endTime: number;
+};
+
+/**
+ * Gom cue SRT thành câu hoàn chỉnh (theo dấu câu), giữ timecode:
+ * bắt đầu = cue đầu của câu, kết thúc = cue cuối của câu.
+ */
+export function aggregateSubtitleBlocksIntoSentences(
+  cues: SubtitleBlock[],
+): SubtitleBlock[] {
+  if (!cues.length) return [];
+
+  const sentences: SubtitleBlock[] = [];
+  let pending = "";
+  let acc: SentenceAccumMeta | null = null;
+
+  const pushSentence = (raw: string, meta: SentenceAccumMeta) => {
+    const text = raw.replace(/\s+/g, " ").trim();
+    if (!text) return;
+    sentences.push({
+      lineIndex: sentences.length,
+      startTime: meta.startTime,
+      endTime: meta.endTime,
+      text,
+      sourceCueStart: meta.sourceStart,
+      sourceCueEnd: meta.sourceEnd,
+    });
+  };
+
+  for (let ci = 0; ci < cues.length; ci++) {
+    const cue = cues[ci];
+    const chunk = cue.text.replace(/\s+/g, " ").trim();
+    if (!chunk) continue;
+
+    if (!acc) {
+      acc = {
+        sourceStart: ci,
+        sourceEnd: ci,
+        startTime: cue.startTime,
+        endTime: cue.endTime,
+      };
+      pending = chunk;
+    } else {
+      acc.sourceEnd = ci;
+      acc.endTime = cue.endTime;
+      pending = `${pending} ${chunk}`;
+    }
+
+    let guard = 0;
+    while (pending && guard++ < 64) {
+      const m = pending.match(COMPLETE_SENTENCE_HEAD_RE);
+      if (!m) break;
+      pushSentence(m[1], acc);
+      pending = pending.slice(m[0].length).trim();
+      if (pending) {
+        acc = {
+          sourceStart: ci,
+          sourceEnd: ci,
+          startTime: cue.startTime,
+          endTime: cue.endTime,
+        };
+      } else {
+        acc = null;
+      }
+    }
+  }
+
+  if (pending.trim() && acc) {
+    pushSentence(pending, acc);
+  }
+
+  return sentences;
 }
 
 /** Giữ tổng duration các clip trong scene khớp `targetTotal` (đồng bộ SRT / voice-over). */

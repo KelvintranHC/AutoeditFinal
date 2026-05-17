@@ -14,6 +14,8 @@ import dotenv from "dotenv";
 dotenv.config({ path: ".env.local" });
 dotenv.config(); // .env
 
+import { mergeTimedChunksIntoSentenceSrt } from "./lib/srtSentenceFormatting.js";
+
 // ------------------------------------------------------------
 //  Crash protection for async Firestore failures.
 //  The hard-coded Firebase config (AI Studio project) returns
@@ -3107,24 +3109,37 @@ app.post("/api/transcribe-local", upload.single("audio"), async (req, res) => {
         task: "transcribe",
       });
 
-      // 4. Format to SRT
+      // 4. Gom chunk Whisper thành SRT theo câu hoàn chỉnh (không 1 block / 30s)
       let srt = "";
       if (
         output.chunks &&
         Array.isArray(output.chunks) &&
         output.chunks.length > 0
       ) {
-        output.chunks.forEach((chunk: any, index: number) => {
-          const start = formatSRTTime(chunk.timestamp[0] || 0);
-          const end = formatSRTTime(
-            chunk.timestamp[1] || chunk.timestamp[0] + 5,
-          );
-          srt += `${index + 1}\n${start} --> ${end}\n${chunk.text.trim()}\n\n`;
+        const timed = output.chunks.map((chunk: any, index: number) => {
+          const startSec = chunk.timestamp?.[0] ?? 0;
+          const nextStart =
+            output.chunks[index + 1]?.timestamp?.[0] ?? null;
+          const endSec =
+            chunk.timestamp?.[1] ??
+            (typeof nextStart === "number" ? nextStart : startSec + 5);
+          return {
+            text: String(chunk.text || "").trim(),
+            startSec,
+            endSec: Math.max(endSec, startSec + 0.05),
+          };
         });
+        srt = mergeTimedChunksIntoSentenceSrt(timed);
       } else if (output.text && output.text.trim().length > 0) {
-        srt = `1\n00:00:00,000 --> 00:00:10,000\n${output.text.trim()}\n\n`;
+        srt = mergeTimedChunksIntoSentenceSrt([
+          {
+            text: output.text.trim(),
+            startSec: 0,
+            endSec: 10,
+          },
+        ]);
       } else {
-        srt = `1\n00:00:00,000 --> 00:00:05,000\n(Không có nội dung)\n\n`;
+        srt = mergeTimedChunksIntoSentenceSrt([]);
       }
 
       activeTranscriptions.set(transactionId, { status: "done", srt });
