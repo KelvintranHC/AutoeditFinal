@@ -21,14 +21,31 @@ export function formatSrtTimestamp(seconds: number): string {
 }
 
 export function parseSrtTimeToSeconds(timeStr: string): number {
-  const m = timeStr.trim().match(/(\d{2}):(\d{2}):(\d{2})[,.](\d{3})/);
-  if (!m) return 0;
-  return (
-    parseInt(m[1], 10) * 3600 +
-    parseInt(m[2], 10) * 60 +
-    parseInt(m[3], 10) +
-    parseInt(m[4], 10) / 1000
+  const t = timeStr.trim().replace(/\./g, ",");
+  /** HH:MM:SS,mmm hoặc H:MM:SS,mmm (Gemini đôi khi bỏ 0 đầu giờ) */
+  const full = t.match(
+    /^(\d{1,2}):(\d{2}):(\d{2}),(\d{1,3})$/,
   );
+  if (full) {
+    const msRaw = full[4].padEnd(3, "0").slice(0, 3);
+    return (
+      parseInt(full[1], 10) * 3600 +
+      parseInt(full[2], 10) * 60 +
+      parseInt(full[3], 10) +
+      parseInt(msRaw, 10) / 1000
+    );
+  }
+  /** MM:SS,mmm (một số model bỏ cụm giờ) */
+  const short = t.match(/^(\d{1,2}):(\d{2}),(\d{1,3})$/);
+  if (short) {
+    const msRaw = short[3].padEnd(3, "0").slice(0, 3);
+    return (
+      parseInt(short[1], 10) * 60 +
+      parseInt(short[2], 10) +
+      parseInt(msRaw, 10) / 1000
+    );
+  }
+  return 0;
 }
 
 /** Parse SRT thành các đoạn có timecode (mỗi cue gốc = 1 chunk). */
@@ -41,7 +58,7 @@ export function parseSrtToTimedChunks(srt: string): TimedTextChunk[] {
     const timeLine = lines.find((l) => l.includes("-->"));
     if (!timeLine) continue;
     const match = timeLine.match(
-      /(\d{2}:\d{2}:\d{2}[,.]\d{3})\s*-->\s*(\d{2}:\d{2}:\d{2}[,.]\d{3})/,
+      /(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}|\d{1,2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}|\d{1,2}:\d{2}[,.]\d{1,3})/,
     );
     if (!match) continue;
     const idx = lines.indexOf(timeLine);
@@ -153,6 +170,37 @@ export function sanitizeGeminiSrtOutput(raw: string): string {
   const fenced = t.match(/^```(?:srt|text)?\s*\r?\n?([\s\S]*?)```\s*$/i);
   if (fenced) t = fenced[1].trim();
   return t;
+}
+
+/** Thời điểm kết thúc của cue cuối trong SRT (giây). */
+export function getSrtTimelineEndSec(srt: string): number {
+  const chunks = parseSrtToTimedChunks(srt);
+  if (!chunks.length) return 0;
+  return Math.max(...chunks.map((c) => c.endSec));
+}
+
+/** Dịch toàn bộ timecode SRT thêm offsetSec (dùng khi gộp nhiều đoạn transcribe). */
+export function shiftSrtTimestamps(srt: string, offsetSec: number): string {
+  if (!offsetSec || !srt.trim()) return srt;
+  const chunks = parseSrtToTimedChunks(srt).map((c) => ({
+    text: c.text,
+    startSec: c.startSec + offsetSec,
+    endSec: c.endSec + offsetSec,
+  }));
+  if (!chunks.length) return srt;
+  return mergeTimedChunksIntoSentenceSrt(chunks);
+}
+
+/** Gộp nhiều đoạn SRT (đã shift offset nếu cần) thành một file theo thời gian. */
+export function concatSrtParts(parts: string[]): string {
+  const merged: TimedTextChunk[] = [];
+  for (const part of parts) {
+    if (!part?.trim()) continue;
+    merged.push(...parseSrtToTimedChunks(part));
+  }
+  if (!merged.length) return "";
+  merged.sort((a, b) => a.startSec - b.startSec || a.endSec - b.endSec);
+  return mergeTimedChunksIntoSentenceSrt(merged);
 }
 
 /** Chuẩn hóa file SRT có sẵn: gom cue ngắn thành block theo câu. */

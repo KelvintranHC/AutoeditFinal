@@ -2530,6 +2530,63 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+/** Proxy Gemini generateContent — giúp client khi trình duyệt không gọi trực tiếp được Google (Failed to fetch). */
+app.post("/api/ai/gemini-generate", async (req, res) => {
+  try {
+    const apiKey = String(req.header("x-gemini-api-key") || "").trim();
+    if (!apiKey) {
+      return res.status(400).json({ error: "Thiếu header x-gemini-api-key" });
+    }
+    const model = String(req.body?.model || "").trim();
+    const contents = req.body?.contents;
+    const generationConfig =
+      req.body?.generationConfig ?? req.body?.config ?? undefined;
+    if (!model || contents === undefined || contents === null) {
+      return res
+        .status(400)
+        .json({ error: "Thiếu model hoặc contents trong body" });
+    }
+    const mid = model.replace(/^models\//, "");
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/` +
+      `${encodeURIComponent(mid)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents,
+        ...(generationConfig ? { generationConfig } : {}),
+      }),
+    });
+    const data = (await r.json().catch(() => ({}))) as Record<
+      string,
+      unknown
+    >;
+    if (!r.ok) {
+      const errObj = data?.error as { message?: string } | undefined;
+      const msg = errObj?.message || `Gemini HTTP ${r.status}`;
+      return res.status(r.status >= 400 && r.status < 600 ? r.status : 502).json({
+        error: msg,
+      });
+    }
+    const parts = (data?.candidates as Array<{
+      content?: { parts?: Array<{ text?: string }> };
+    }> | undefined)?.[0]?.content?.parts;
+    const text = Array.isArray(parts)
+      ? parts.map((p) => p?.text).filter(Boolean).join("")
+      : "";
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({
+      text,
+      usageMetadata: data?.usageMetadata,
+    });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : "Gemini proxy lỗi";
+    console.error("[api/ai/gemini-generate]", msg);
+    return res.status(500).json({ error: msg });
+  }
+});
+
 // Downloader Manager State
 interface DownloaderJob {
   id: string; // unique ID for this download (e.g. video_{sceneIdx}_{videoIdx})
@@ -3058,6 +3115,195 @@ const activeTranscriptions = new Map<
   { status: "processing" | "done" | "error"; srt?: string; error?: string }
 >();
 
+type TranscriptionSegmentWork = {
+  createdAt: number;
+  dir: string;
+  durationSec: number;
+  segmentSec: number;
+  chunks: {
+    index: number;
+    startSec: number;
+    endSec: number;
+    filePath: string;
+  }[];
+};
+
+const transcriptionSegmentWorks = new Map<string, TranscriptionSegmentWork>();
+
+function probeAudioDurationSec(filePath: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(filePath, (err, data) => {
+      if (err) return reject(err);
+      const d = data?.format?.duration;
+      resolve(typeof d === "number" && d > 0 ? d : 0);
+    });
+  });
+}
+
+function cleanupTranscriptionSegmentWork(workId: string) {
+  const job = transcriptionSegmentWorks.get(workId);
+  if (!job) return;
+  transcriptionSegmentWorks.delete(workId);
+  try {
+    if (fs.existsSync(job.dir)) {
+      fs.rmSync(job.dir, { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.warn("[segments] cleanup failed", workId, e);
+  }
+}
+
+/** Chia file âm thanh dài thành các đoạn cho Gemini (POST + upload field `audio`). */
+async function handleTranscriptionSegments(
+  req: express.Request,
+  res: express.Response,
+) {
+    if (!req.file) {
+      return res.status(400).json({ error: "No audio file provided" });
+    }
+
+    const segmentSec = Math.min(
+      360,
+      Math.max(60, Number(req.body?.segmentSec) || 120),
+    );
+    const workId = uuidv4();
+    const dir = path.join(tempDirBase, `transcribe_segments_${workId}`);
+    fs.mkdirSync(dir, { recursive: true });
+
+    const originalExt = path.extname(req.file.originalname) || ".mp3";
+    const inputPath = req.file.path + originalExt;
+    fs.renameSync(req.file.path, inputPath);
+
+    try {
+      const durationSec = await probeAudioDurationSec(inputPath);
+      if (durationSec <= 0) {
+        throw new Error("Không đọc được độ dài file âm thanh.");
+      }
+
+      const pattern = path.join(dir, "part_%03d.mp3");
+      await new Promise<void>((resolve, reject) => {
+        ffmpeg(inputPath)
+          .outputOptions([
+            "-f",
+            "segment",
+            `-segment_time`,
+            String(segmentSec),
+            "-reset_timestamps",
+            "1",
+            "-map",
+            "0:a",
+            "-c:a",
+            "libmp3lame",
+            "-b:a",
+            "96k",
+          ])
+          .output(pattern)
+          .on("end", () => resolve())
+          .on("error", (err) => reject(err))
+          .run();
+      });
+
+      if (fs.existsSync(inputPath)) fs.unlinkSync(inputPath);
+
+      const files = fs
+        .readdirSync(dir)
+        .filter((f) => /^part_\d+\.mp3$/i.test(f))
+        .sort();
+
+      if (!files.length) {
+        throw new Error("Không tạo được đoạn âm thanh.");
+      }
+
+      const chunks: TranscriptionSegmentWork["chunks"] = files.map(
+        (file, index) => {
+          const startSec = index * segmentSec;
+          const endSec = Math.min(durationSec, startSec + segmentSec);
+          return {
+            index,
+            startSec,
+            endSec,
+            filePath: path.join(dir, file),
+          };
+        },
+      );
+
+      transcriptionSegmentWorks.set(workId, {
+        createdAt: Date.now(),
+        dir,
+        durationSec,
+        segmentSec,
+        chunks,
+      });
+
+      setTimeout(() => cleanupTranscriptionSegmentWork(workId), 45 * 60 * 1000);
+
+      res.json({
+        workId,
+        durationSec,
+        segmentSec,
+        chunks: chunks.map((c) => ({
+          index: c.index,
+          startSec: c.startSec,
+          endSec: c.endSec,
+          url: `/api/audio/transcription-segments/${workId}/${c.index}`,
+        })),
+      });
+    } catch (error: any) {
+      cleanupTranscriptionSegmentWork(workId);
+      if (fs.existsSync(inputPath)) {
+        try {
+          fs.unlinkSync(inputPath);
+        } catch {
+          /* ignore */
+        }
+      }
+      console.error("[transcription-segments]", error);
+      res.status(500).json({
+        error: error?.message || "Failed to split audio",
+      });
+    }
+}
+
+app.post(
+  "/api/audio/transcription-segments",
+  upload.single("audio"),
+  handleTranscriptionSegments,
+);
+app.post(
+  "/api/transcribe/segments",
+  upload.single("audio"),
+  handleTranscriptionSegments,
+);
+
+function sendTranscriptionSegmentFile(
+  req: express.Request,
+  res: express.Response,
+) {
+  const work = transcriptionSegmentWorks.get(req.params.workId);
+  if (!work) {
+    return res.status(404).json({ error: "Segment job not found or expired" });
+  }
+  const idx = Number(req.params.index);
+  const chunk = work.chunks.find((c) => c.index === idx);
+  if (!chunk || !fs.existsSync(chunk.filePath)) {
+    return res.status(404).json({ error: "Segment not found" });
+  }
+  res.setHeader("Content-Type", "audio/mpeg");
+  res.sendFile(chunk.filePath);
+}
+
+app.get("/api/audio/transcription-segments/:workId/:index", sendTranscriptionSegmentFile);
+app.get("/api/transcribe/segments/:workId/:index", sendTranscriptionSegmentFile);
+
+app.delete("/api/audio/transcription-segments/:workId", (req, res) => {
+  cleanupTranscriptionSegmentWork(req.params.workId);
+  res.json({ ok: true });
+});
+app.delete("/api/transcribe/segments/:workId", (req, res) => {
+  cleanupTranscriptionSegmentWork(req.params.workId);
+  res.json({ ok: true });
+});
+
 app.post("/api/transcribe-local", upload.single("audio"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No audio file provided" });
@@ -3101,13 +3347,21 @@ app.post("/api/transcribe-local", upload.single("audio"), async (req, res) => {
 
       // 3. Transcribe
       const p = await getTranscriber();
-      const output = await p(audioData, {
+      const whisperOpts: Record<string, unknown> = {
         chunk_length_s: 30,
         stride_length_s: 5,
         return_timestamps: true,
-        language: "vietnamese",
         task: "transcribe",
-      });
+      };
+      const langHint =
+        typeof req.body?.language === "string"
+          ? req.body.language.trim().toLowerCase()
+          : "";
+      if (langHint && langHint !== "auto") {
+        whisperOpts.language = langHint;
+      }
+
+      const output = await p(audioData, whisperOpts);
 
       // 4. Gom chunk Whisper thành SRT theo câu hoàn chỉnh (không 1 block / 30s)
       let srt = "";

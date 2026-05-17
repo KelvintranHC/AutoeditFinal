@@ -83,11 +83,14 @@ import {
   buildVietnameseSceneNotesPrompt,
   detectSubtitleLangHint,
   parseVietnameseSceneNotes,
+  chunkArray,
   mergeKeywordPlansWithDrafts,
   mergeMeaningBeatsToVisualScenes,
+  MEANING_BEATS_LINES_PER_BATCH,
   normalizeSceneSelectedVideos,
   parseKeywordPlans,
   plansLookGeneric,
+  SCENE_KEYWORDS_BATCH_SIZE,
   rankStockVideos,
   ruleBasedMeaningBeats,
   mergeEditorScenesAtIndices,
@@ -97,6 +100,7 @@ import {
   topStoryblocksKeywordsForScene,
 } from "./scenePlanning";
 import { buildGeminiJsonConfig } from "./geminiConfig";
+import { generateContentWithFallback } from "./lib/geminiClient";
 import {
   APP_NAME,
   APP_VERSION,
@@ -113,10 +117,9 @@ import {
   saveUserConfigApi,
   updateProjectApi,
 } from "./lib/projectApi";
-import {
-  mergeSrtCuesIntoSentenceBlocks,
-  sanitizeGeminiSrtOutput,
-} from "../lib/srtSentenceFormatting";
+import { mergeSrtCuesIntoSentenceBlocks } from "../lib/srtSentenceFormatting";
+import { getAudioDurationSec, srtCoverageRatio } from "./lib/audioTranscription";
+import { transcribeMp3ToSrtWithGemini } from "./lib/geminiAudioTranscription";
 import {
   type Project,
   type UserAppConfig,
@@ -1154,75 +1157,34 @@ export default function App() {
     if (e.target) e.target.value = "";
   };
 
-  const transcribeAudio = async (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = async () => {
-        try {
-          if (!ai) {
-            throw new Error(
-              "Gemini API Key chưa được thiết lập. Vui lòng kiểm tra Settings hoặc cung cấp Key.",
-            );
-          }
-          const base64Data = (reader.result as string).split(",")[1];
-          const transcribePrompt = `Lắng nghe file âm thanh và tạo file SRT chuẩn.
-
-QUY TẮC BẮT BUỘC:
-- Mỗi subtitle block phải kết thúc khi một CÂU HOÀN CHỈNH kết thúc (dấu . ? ! … hoặc ...).
-- KHÔNG chia block theo cố định vài giây, theo nhịp thở, hay theo chunk xử lý — chỉ chia tại dấu kết thúc câu.
-- Nếu một câu dài trải qua nhiều nhịp nói, gộp vào MỘT block cho đến khi hết câu.
-- Timestamp: thời gian bắt đầu = lúc bắt đầu câu; thời gian kết thúc = lúc kết thúc câu (không cắt giữa câu).
-- Giữ nguyên ngôn ngữ lời thoại (Đức, Việt, Anh, v.v.).
-
-Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), không giải thích thêm.`;
-
-          const result = await recordGeminiStep(
-            "mp3_to_srt",
-            config.transcriptionModel,
-            () =>
-              ai!.models.generateContent({
-                model: config.transcriptionModel,
-                contents: [
-                  {
-                    role: "user",
-                    parts: [
-                      {
-                        inlineData: {
-                          mimeType: file.type || "audio/mp3",
-                          data: base64Data,
-                        },
-                      },
-                      { text: transcribePrompt },
-                    ],
-                  },
-                ],
-              }),
-            { promptPreview: transcribePrompt },
-          );
-
-          resolve(result.text || "");
-        } catch (err: any) {
-          reject(
-            new Error("Lỗi khi dùng AI tạo transcript: " + formatAIError(err)),
-          );
-        }
-      };
-      reader.onerror = (error) => reject(error);
-    });
-  };
-
   const handleImportMP3 = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    if (!ai) {
+      toast.error("Cần Gemini API Key trong Settings để chuyển MP3 → SRT.");
+      setIsSettingsOpen(true);
+      if (e.target) e.target.value = "";
+      return;
+    }
+
     setIsTranscribing(true);
-    toast.loading("Đang phân tích âm thanh và tạo SRT...", {
+    toast.loading("Gemini — đang transcribe MP3 → SRT...", {
       id: "transcribing",
     });
 
     try {
-      const rawSrt = sanitizeGeminiSrtOutput(await transcribeAudio(file));
+      const rawSrt = await transcribeMp3ToSrtWithGemini({
+        file,
+        ai,
+        apiKey: config.geminiApiKey,
+        model: config.transcriptionModel,
+        invoke: (fn, meta) =>
+          recordGeminiStep("mp3_to_srt", config.transcriptionModel, fn, {
+            promptPreview: meta.promptPreview,
+          }),
+        onProgress: (msg) => toast.loading(msg, { id: "transcribing" }),
+      });
 
       if (!rawSrt || rawSrt.length < 10) {
         throw new Error("Không thể trích xuất phụ đề từ âm thanh này.");
@@ -1232,6 +1194,19 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
       const srtContent = mergeSrtCuesIntoSentenceBlocks(rawSrt);
       if (!srtContent || srtContent.length < 5) {
         throw new Error("Không tạo được SRT hợp lệ từ kết quả transcribe.");
+      }
+
+      try {
+        const expectedDur = await getAudioDurationSec(file);
+        const cov = srtCoverageRatio(srtContent, expectedDur);
+        if (cov < 0.8) {
+          toast(
+            `SRT có thể mới phủ ~${Math.round(cov * 100)}% thời lượng file — hãy kiểm tra cuối file hoặc thử import lại.`,
+            { id: "transcribing", icon: "⚠️", duration: 6000 },
+          );
+        }
+      } catch {
+        /* bỏ qua nếu không đọc được duration */
       }
 
       setUploadedAudioFile(file);
@@ -1253,12 +1228,10 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
         void saveProjectState(srtContent, scenesRef.current);
       }
 
-      toast.success("Đã tạo phụ đề từ âm thanh!", { id: "transcribing" });
-
-      // Auto trigger process
-      setTimeout(() => {
-        handleProcessScript();
-      }, 500);
+      toast.success(
+        "Đã tạo SRT — bấm «Phân tích SRT» khi sẵn sàng (không tự quét Storyblocks).",
+        { id: "transcribing", duration: 5000 },
+      );
     } catch (err: any) {
       console.error("Transcription error:", err);
       toast.error(err.message || "Lỗi khi xử lý MP3", { id: "transcribing" });
@@ -1656,10 +1629,14 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
           "regenerate_keywords_en",
           config.analysisModel,
           () =>
-            ai.models.generateContent({
+            generateContentWithFallback({
+              ai,
+              apiKey: config.geminiApiKey,
               model: config.analysisModel,
               contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
-              config: buildGeminiJsonConfig("scene_keywords"),
+              config: buildGeminiJsonConfig("scene_keywords", {
+                sceneCount: 1,
+              }),
             }),
           { promptPreview: kwPrompt },
         ),
@@ -1667,10 +1644,14 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
           "scene_summaries_vi",
           config.analysisModel,
           () =>
-            ai.models.generateContent({
+            generateContentWithFallback({
+              ai,
+              apiKey: config.geminiApiKey,
               model: config.analysisModel,
               contents: [{ role: "user", parts: [{ text: viPrompt }] }],
-              config: buildGeminiJsonConfig("scene_summaries_vi"),
+              config: buildGeminiJsonConfig("scene_summaries_vi", {
+                sceneCount: 1,
+              }),
             }),
           { promptPreview: viPrompt },
         ),
@@ -1796,31 +1777,60 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
           id: "analyze-srt",
         });
 
-        const beatsPrompt = buildMeaningBeatsPrompt(
-          linePayload,
-          visualKeywordDirection,
-          langHint,
-        );
-        const beatsRes = await recordGeminiStep(
-          "meaning_beats",
-          config.analysisModel,
-          () =>
-            ai!.models.generateContent({
-              model: config.analysisModel,
-              contents: [{ role: "user", parts: [{ text: beatsPrompt }] }],
-              config: buildGeminiJsonConfig("meaning_beats"),
-            }),
-          { promptPreview: beatsPrompt },
-        );
-
         let meaningBeats: any[] = [];
-        try {
-          const beatsParsed = robustJsonParse(beatsRes.text || "{}");
-          meaningBeats = Array.isArray(beatsParsed.meaning_beats)
-            ? beatsParsed.meaning_beats
-            : [];
-        } catch (e) {
-          console.error("Meaning beats parse error:", e);
+        const beatBatches = chunkArray(
+          linePayload,
+          MEANING_BEATS_LINES_PER_BATCH,
+        );
+        const totalBeatBatches = beatBatches.length;
+
+        for (let bi = 0; bi < beatBatches.length; bi++) {
+          const batch = beatBatches[bi];
+          if (totalBeatBatches > 1) {
+            toast.loading(
+              `Meaning beats — lô ${bi + 1}/${totalBeatBatches} (${batch.length} câu)...`,
+              { id: "analyze-srt" },
+            );
+          }
+          const beatsPrompt = buildMeaningBeatsPrompt(
+            batch,
+            visualKeywordDirection,
+            langHint,
+            {
+              globalLineCount: linePayload.length,
+              batchNote:
+                totalBeatBatches > 1
+                  ? `Batch ${bi + 1}/${totalBeatBatches}: only assign indices present in this JSON array.`
+                  : undefined,
+            },
+          );
+          try {
+            const beatsRes = await recordGeminiStep(
+              "meaning_beats",
+              config.analysisModel,
+              () =>
+                generateContentWithFallback({
+                  ai: ai!,
+                  apiKey: config.geminiApiKey,
+                  model: config.analysisModel,
+                  contents: [{ role: "user", parts: [{ text: beatsPrompt }] }],
+                  config: buildGeminiJsonConfig("meaning_beats", {
+                    lineCount: batch.length,
+                  }),
+                }),
+              { promptPreview: beatsPrompt },
+            );
+            const beatsParsed = robustJsonParse(beatsRes.text || "{}");
+            const batchBeats = Array.isArray(beatsParsed.meaning_beats)
+              ? beatsParsed.meaning_beats
+              : [];
+            meaningBeats.push(...batchBeats);
+          } catch (e) {
+            console.error(`Meaning beats batch ${bi + 1} parse error:`, e);
+          }
+        }
+
+        if (meaningBeats.length === 0) {
           toast.error(
             "Không đọc được meaning beats. Gom cảnh theo luật mặc định.",
             { id: "analyze-srt" },
@@ -1850,63 +1860,121 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
         if (drafts.length === 0)
           throw new Error("Không thể tạo visual scene từ SRT.");
 
+        const kwBatches = chunkArray(drafts, SCENE_KEYWORDS_BATCH_SIZE);
+        const totalKwBatches = kwBatches.length;
+
         toast.loading(
-          "Gemini — Keywords EN + ghi chú tiếng Việt (song song)...",
+          totalKwBatches > 1
+            ? `Gemini — Keywords EN (${totalKwBatches} lô) + ghi chú VI...`
+            : "Gemini — Keywords EN + ghi chú tiếng Việt (song song)...",
           { id: "analyze-srt" },
         );
 
-        const kwPrompt = buildSceneKeywordsPrompt(
-          drafts,
-          visualKeywordDirection,
-          langHint,
-        );
-        const viPrompt = buildVietnameseSceneNotesPrompt(drafts);
+        let plans: ReturnType<typeof parseKeywordPlans> = [];
+        const vietnameseNotes: string[] = new Array(drafts.length).fill("");
 
-        const [kwRes, viRes] = await Promise.all([
-          recordGeminiStep(
-            "scene_keywords",
-            config.analysisModel,
-            () =>
-              ai!.models.generateContent({
-                model: config.analysisModel,
-                contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
-                config: buildGeminiJsonConfig("scene_keywords"),
-              }),
-            { promptPreview: kwPrompt },
-          ),
-          recordGeminiStep(
-            "scene_summaries_vi",
-            config.analysisModel,
-            () =>
-              ai!.models.generateContent({
-                model: config.analysisModel,
-                contents: [{ role: "user", parts: [{ text: viPrompt }] }],
-                config: buildGeminiJsonConfig("scene_summaries_vi"),
-              }),
-            { promptPreview: viPrompt },
-          ),
-        ]);
+        for (let bi = 0; bi < kwBatches.length; bi++) {
+          const slice = kwBatches[bi];
+          const offset = bi * SCENE_KEYWORDS_BATCH_SIZE;
+          if (totalKwBatches > 1) {
+            toast.loading(
+              `Keywords EN — lô ${bi + 1}/${totalKwBatches} (${slice.length} phân cảnh)...`,
+              { id: "analyze-srt" },
+            );
+          }
 
-        let vietnameseNotes: string[] = [];
-        try {
-          const viParsed = robustJsonParse(viRes.text || "{}");
-          vietnameseNotes = parseVietnameseSceneNotes(
-            viParsed,
+          const kwPrompt = buildSceneKeywordsPrompt(
+            slice,
+            visualKeywordDirection,
+            langHint,
+          );
+          const viPrompt = buildVietnameseSceneNotesPrompt(slice);
+
+          const [kwRes, viRes] = await Promise.all([
+            recordGeminiStep(
+              "scene_keywords",
+              config.analysisModel,
+              () =>
+                generateContentWithFallback({
+                  ai: ai!,
+                  apiKey: config.geminiApiKey,
+                  model: config.analysisModel,
+                  contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
+                  config: buildGeminiJsonConfig("scene_keywords", {
+                    sceneCount: slice.length,
+                  }),
+                }),
+              { promptPreview: kwPrompt },
+            ),
+            recordGeminiStep(
+              "scene_summaries_vi",
+              config.analysisModel,
+              () =>
+                generateContentWithFallback({
+                  ai: ai!,
+                  apiKey: config.geminiApiKey,
+                  model: config.analysisModel,
+                  contents: [{ role: "user", parts: [{ text: viPrompt }] }],
+                  config: buildGeminiJsonConfig("scene_summaries_vi", {
+                    sceneCount: slice.length,
+                  }),
+                }),
+              { promptPreview: viPrompt },
+            ),
+          ]);
+
+          try {
+            const viParsed = robustJsonParse(viRes.text || "{}");
+            const batchNotes = parseVietnameseSceneNotes(
+              viParsed,
+              slice.length,
+              slice,
+            );
+            for (let i = 0; i < batchNotes.length; i++) {
+              vietnameseNotes[offset + i] = batchNotes[i];
+            }
+          } catch (e) {
+            console.error("Vietnamese scene notes batch parse error:", e);
+            const fallback = parseVietnameseSceneNotes({}, slice.length, slice);
+            for (let i = 0; i < fallback.length; i++) {
+              if (!vietnameseNotes[offset + i]) {
+                vietnameseNotes[offset + i] = fallback[i];
+              }
+            }
+          }
+
+          try {
+            const kwParsed = robustJsonParse(kwRes.text || "{}");
+            const batchPlans = parseKeywordPlans(
+              kwParsed,
+              slice.length,
+              slice,
+            );
+            for (let i = 0; i < batchPlans.length; i++) {
+              plans.push({ ...batchPlans[i], scene_index: offset + i });
+            }
+          } catch (e) {
+            console.error("Keyword plan batch parse error:", e);
+            const fallback = parseKeywordPlans({}, slice.length, slice);
+            for (let i = 0; i < fallback.length; i++) {
+              plans.push({ ...fallback[i], scene_index: offset + i });
+            }
+          }
+        }
+
+        for (let i = 0; i < drafts.length; i++) {
+          if (!vietnameseNotes[i]?.trim()) {
+            vietnameseNotes[i] = drafts[i]?.text.slice(0, 200) ?? "";
+          }
+        }
+
+        if (plans.length !== drafts.length) {
+          const repaired = parseKeywordPlans(
+            { scenes: plans },
             drafts.length,
             drafts,
           );
-        } catch (e) {
-          console.error("Vietnamese scene notes parse error:", e);
-          vietnameseNotes = parseVietnameseSceneNotes({}, drafts.length, drafts);
-        }
-
-        let plans;
-        try {
-          const kwParsed = robustJsonParse(kwRes.text || "{}");
-          plans = parseKeywordPlans(kwParsed, drafts.length, drafts);
-        } catch (e) {
-          console.error("Keyword plan parse error:", e);
-          plans = parseKeywordPlans({}, drafts.length, drafts);
+          plans.splice(0, plans.length, ...repaired);
         }
 
         if (plansLookGeneric(plans)) {
@@ -1998,7 +2066,9 @@ Văn bản: ${scriptText}`;
               "keyword_generation",
               config.analysisModel,
               () =>
-                ai!.models.generateContent({
+                generateContentWithFallback({
+                  ai: ai!,
+                  apiKey: config.geminiApiKey,
                   model: config.analysisModel,
                   contents: [{ role: "user", parts: [{ text: prompt }] }],
                   config: buildGeminiJsonConfig("keyword_generation"),
@@ -3688,8 +3758,12 @@ Văn bản: ${scriptText}`;
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                   <div className="space-y-2">
                     <label className="text-[10px] text-slate-500 uppercase font-bold px-1">
-                      Transcription Engine
+                      MP3 → SRT (Gemini)
                     </label>
+                    <p className="text-[9px] text-slate-500 px-1 leading-snug">
+                      File &gt; ~3,5 phút tự chia đoạn và gộp SRT. Khuyến nghị
+                      gemini-2.5-flash.
+                    </p>
                     <select
                       value={config.transcriptionModel}
                       onChange={(e) =>

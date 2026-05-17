@@ -909,16 +909,192 @@ export function detectSubtitleLangHint(
   return "auto";
 }
 
+/** Gemini keyword calls — tránh JSON cắt cụt khi SRT dài (10–15 phút). */
+export const SCENE_KEYWORDS_BATCH_SIZE = 6;
+
+/** Meaning-beats theo lô câu — giữ output trong giới hạn token. */
+export const MEANING_BEATS_LINES_PER_BATCH = 40;
+
 const GENERIC_KEYWORD_RE =
   /^(b-?roll(\s+footage)?|stock\s+(video\s+)?b-?roll|documentary\s+b-?roll|generic\s+contextual\s+footage|relevant\s+stock\s+b-?roll)$/i;
+
+const WEAK_ZONE_FALLBACK_KEYWORD_RE =
+  /^(dramatic opening|closing conclusion|documentary)(\s+scene)?(\s+\d+)?$/i;
 
 const GENERIC_VISUAL_HINT_RE =
   /^(generic|relevant\s+stock|b-?roll|footage|contextual)/i;
 
+const NARRATION_STOPWORDS = new Set([
+  "the",
+  "and",
+  "with",
+  "from",
+  "this",
+  "that",
+  "have",
+  "been",
+  "were",
+  "was",
+  "are",
+  "for",
+  "not",
+  "but",
+  "you",
+  "your",
+  "they",
+  "their",
+  "what",
+  "when",
+  "where",
+  "which",
+  "who",
+  "how",
+  "all",
+  "can",
+  "will",
+  "just",
+  "about",
+  "into",
+  "over",
+  "also",
+  "than",
+  "then",
+  "there",
+  "here",
+  "very",
+  "more",
+  "some",
+  "such",
+  "only",
+  "other",
+  "after",
+  "before",
+  "because",
+  "while",
+  "during",
+  "through",
+  "between",
+  "under",
+  "above",
+  "below",
+  "again",
+  "still",
+  "even",
+  "much",
+  "many",
+  "most",
+  "each",
+  "both",
+  "der",
+  "die",
+  "das",
+  "den",
+  "dem",
+  "des",
+  "ein",
+  "eine",
+  "einer",
+  "einem",
+  "einen",
+  "und",
+  "oder",
+  "aber",
+  "nicht",
+  "auch",
+  "nur",
+  "noch",
+  "schon",
+  "wenn",
+  "wie",
+  "was",
+  "wer",
+  "wir",
+  "sie",
+  "ihr",
+  "ihre",
+  "sein",
+  "sind",
+  "war",
+  "wird",
+  "wurde",
+  "haben",
+  "hat",
+  "mit",
+  "von",
+  "zum",
+  "zur",
+  "auf",
+  "aus",
+  "bei",
+  "nach",
+  "vor",
+  "über",
+  "unter",
+  "dass",
+  "diese",
+  "dieser",
+  "dieses",
+  "einem",
+  "einen",
+  "einer",
+  "eines",
+]);
+
+export function chunkArray<T>(items: T[], size: number): T[][] {
+  if (size <= 0) return items.length ? [items] : [];
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+  return out;
+}
+
 export function isGenericStockKeyword(k: string): boolean {
   const t = k.trim();
   if (t.length < 2) return true;
-  return GENERIC_KEYWORD_RE.test(t);
+  if (GENERIC_KEYWORD_RE.test(t)) return true;
+  if (WEAK_ZONE_FALLBACK_KEYWORD_RE.test(t)) return true;
+  return false;
+}
+
+/** Gợi ý keyword EN từ narration khi Gemini/beats không trả topic cụ thể. */
+export function extractNarrationKeywordHints(
+  narration: string,
+  max = 3,
+): string[] {
+  const raw = (narration || "").replace(/\s+/g, " ").trim();
+  if (raw.length < 8) return [];
+
+  const tokens = raw
+    .replace(/[^\p{L}\p{N}\s'-]/gu, " ")
+    .split(/\s+/)
+    .map((w) => w.trim())
+    .filter((w) => w.length > 2 && !NARRATION_STOPWORDS.has(w.toLowerCase()));
+
+  if (!tokens.length) return [];
+
+  const seen = new Set<string>();
+  const out: string[] = [];
+
+  const push = (phrase: string) => {
+    const t = phrase.trim();
+    if (t.length < 3 || isGenericStockKeyword(t)) return;
+    const key = t.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push(t);
+  };
+
+  if (tokens.length >= 2) {
+    push(`${tokens[0]} ${tokens[1]}`);
+    if (tokens.length >= 3) push(`${tokens[1]} ${tokens[2]}`);
+  }
+  for (const t of tokens.slice(0, 6)) {
+    if (out.length >= max) break;
+    push(t);
+  }
+
+  return out.slice(0, max);
 }
 
 /** Gom beat theo nhóm câu khi Gemini meaning-beats thất bại. */
@@ -952,9 +1128,21 @@ export function buildMeaningBeatsPrompt(
   lines: { index: number; text: string; start_sec: number; end_sec: number }[],
   visualStyleUserNotes: string,
   langHint = "auto",
+  opts?: { globalLineCount?: number; batchNote?: string },
 ): string {
   const style = (visualStyleUserNotes || "").trim();
-  const lastIdx = lines.length - 1;
+  const indices = lines.map((l) => l.index);
+  const firstIdx = indices.length ? Math.min(...indices) : 0;
+  const lastIdx = indices.length ? Math.max(...indices) : 0;
+  const globalLast =
+    typeof opts?.globalLineCount === "number" && opts.globalLineCount > 0
+      ? opts.globalLineCount - 1
+      : lastIdx;
+  const batchNote =
+    opts?.batchNote ||
+    (lines.length < globalLast + 1
+      ? `This batch covers sentence indices ${firstIdx}..${lastIdx} only (file has ${globalLast + 1} sentences total). Use each row's "index" field as start_line_index/end_line_index.`
+      : "");
   const langLine =
     langHint === "de"
       ? "Input is GERMAN subtitles — read German, but topic and suggested_visual_direction_en MUST be English stock-search phrases."
@@ -968,7 +1156,8 @@ export function buildMeaningBeatsPrompt(
 ${langLine}
 
 Each beat:
-- start_line_index, end_line_index (0..${lastIdx}) — inclusive sentence indices
+- start_line_index, end_line_index — MUST match the "index" field on sentence rows (this batch: ${firstIdx}..${lastIdx})
+${batchNote ? `- ${batchNote}` : ""}
 - summary_vi: short Vietnamese summary of beat content (translate if source is not Vietnamese)
 - topic: REQUIRED 2-4 English words for stock video search (specific, not "general" or "b-roll")
 - importance: 1-5
@@ -1080,6 +1269,13 @@ export function keywordPlanFromDraft(
   );
 
   if (keywords.length === 0) {
+    const fromNarration = extractNarrationKeywordHints(draft.text, 3);
+    if (fromNarration.length > 0) {
+      keywords = fromNarration;
+    }
+  }
+
+  if (keywords.length === 0) {
     const zoneLabel =
       draft.pacingZone === "hook"
         ? "dramatic opening"
@@ -1116,13 +1312,23 @@ export function buildKeywordPlansFromDrafts(
 
 export function plansLookGeneric(plans: SceneKeywordPlan[]): boolean {
   if (!plans.length) return true;
-  const primaries = plans.map(
-    (p) =>
+  const primaries = plans
+    .map((p) =>
       (p.storyblocks_search_queries[0] || p.keywords[0] || "").toLowerCase().trim(),
-  );
+    )
+    .filter(Boolean);
+  if (!primaries.length) return true;
   if (primaries.every((k) => isGenericStockKeyword(k))) return true;
-  const uniq = new Set(primaries.filter(Boolean));
-  return uniq.size === 1 && isGenericStockKeyword(primaries[0] || "");
+  const uniq = new Set(primaries);
+  if (uniq.size === 1) return true;
+  const top = [...uniq].sort(
+    (a, b) =>
+      primaries.filter((p) => p === b).length -
+      primaries.filter((p) => p === a).length,
+  )[0];
+  const topCount = primaries.filter((p) => p === top).length;
+  if (topCount / primaries.length >= 0.65) return true;
+  return false;
 }
 
 export function mergeKeywordPlansWithDrafts(
