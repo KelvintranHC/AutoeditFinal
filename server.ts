@@ -2536,6 +2536,8 @@ interface DownloaderJob {
   diagnostic?: string;
   screenshot?: string; // Live capture
   driveLink?: string;
+  /** Direct download URL (webContentLink or uc?id=). */
+  driveDirectLink?: string;
   driveFileId?: string;
   downloadDuration?: number;
   uploadDuration?: number;
@@ -2896,6 +2898,11 @@ app.post("/api/downloader/start", async (req, res) => {
               uploadToGoogleDrive(capturedFilePath, fileName, driveToken, driveFolderId)
                 .then((driveRes) => {
                   capturedJobRef.driveLink = driveRes.webViewLink || driveRes.webContentLink || "";
+                  capturedJobRef.driveDirectLink =
+                    driveRes.webContentLink ||
+                    (driveRes.id
+                      ? `https://drive.google.com/uc?export=download&id=${driveRes.id}`
+                      : undefined);
                   capturedJobRef.driveFileId = driveRes.id ?? undefined;
                   capturedJobRef.uploadDuration = Math.round((Date.now() - uploadStartTime) / 1000);
                   if (capturedJobRef.status === "uploading") capturedJobRef.status = "success";

@@ -3,7 +3,7 @@ import {
   Loader2, CheckCircle2, XCircle, HardDrive, DownloadCloud, 
   Terminal, History, Key, Monitor, Play, FileText, Activity, 
   BarChart3, ShieldCheck, Zap, List as ListIcon, ArrowLeft, Copy,
-  MonitorPlay, Clock, ExternalLink, Download
+  MonitorPlay, ExternalLink, Download, Link2
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { db, auth, handleFirestoreError, OperationType } from "../lib/firebase";
@@ -29,6 +29,25 @@ function mergedExportBasenameFromUrl(url: string | undefined | null): string | n
   return /^drive_merge_mj_.+\.mp4$/i.test(base) ? base : null;
 }
 
+function resolveDriveDirectLink(v: {
+  driveDirectLink?: string;
+  driveFileId?: string;
+  driveLink?: string;
+}): string | null {
+  if (v.driveDirectLink?.trim()) return v.driveDirectLink.trim();
+  const id = resolveDriveFileIdForVideo(v);
+  if (id) return `https://drive.google.com/uc?export=download&id=${id}`;
+  return null;
+}
+
+function mergeCacheKey(projectId: string) {
+  return `automation_merge_${projectId}`;
+}
+
+function mergeDriveCacheKey(projectId: string) {
+  return `automation_merge_drive_${projectId}`;
+}
+
 interface Job {
   id: string;
   stockUrl: string;
@@ -37,6 +56,7 @@ interface Job {
   diagnostic?: string;
   screenshot?: string;
   driveLink?: string;
+  driveDirectLink?: string;
   driveFileId?: string;
   downloadDuration?: number;
   uploadDuration?: number;
@@ -44,6 +64,59 @@ interface Job {
   fileSizeBytes?: number;
   error?: string;
 }
+
+const DriveLinkActions = ({
+  viewLink,
+  directLink,
+  compact = false,
+}: {
+  viewLink?: string;
+  directLink?: string | null;
+  compact?: boolean;
+}) => {
+  const direct = directLink || (viewLink ? resolveDriveDirectLink({ driveLink: viewLink }) : null);
+  if (!viewLink && !direct) return null;
+  const copy = (url: string) => {
+    navigator.clipboard.writeText(url).catch(() => {});
+  };
+  return (
+    <motion.div layout className={`flex flex-wrap items-center gap-1 ${compact ? "" : "gap-1.5"}`}>
+      {viewLink && (
+        <a
+          href={viewLink}
+          target="_blank"
+          rel="noreferrer"
+          className="inline-flex items-center gap-1 bg-emerald-100 hover:bg-emerald-200 text-emerald-800 px-2 py-0.5 rounded text-[8px] font-bold transition-colors"
+        >
+          <ExternalLink size={10} />
+          VIEW DRIVE
+        </a>
+      )}
+      {direct && (
+        <>
+          <a
+            href={direct}
+            target="_blank"
+            rel="noreferrer"
+            className="inline-flex items-center gap-1 bg-indigo-100 hover:bg-indigo-200 text-indigo-900 px-2 py-0.5 rounded text-[8px] font-bold transition-colors"
+            title={direct}
+          >
+            <Link2 size={10} />
+            DIRECT
+          </a>
+          <button
+            type="button"
+            onClick={() => copy(direct)}
+            className="p-0.5 rounded hover:bg-[#1a1a1a]/10 text-[#4a4a40]"
+            title="Copy direct link"
+          >
+            <Copy size={10} />
+          </button>
+        </>
+      )}
+    </motion.div>
+  );
+};
 
 const LiveBrowser = ({ job, projectId }: { job: Job; projectId: string }) => {
   const containerRef = React.useRef<HTMLDivElement>(null);
@@ -125,11 +198,11 @@ const LiveBrowser = ({ job, projectId }: { job: Job; projectId: string }) => {
 export function AutomationDownloader({ projectId, scenes, config, onConnectDrive, onClose, onUpdateScenes, onMerge, mergeJobId, onMergeJobClear }: any) {
   const [activeSubTab, setActiveSubTab] = useState<"queue" | "auth" | "logs" | "live" | "metrics">("queue");
   const [jobs, setJobs] = useState<Job[]>([]);
-  const [currentTime, setCurrentTime] = useState(new Date());
   const [mergeStatus, setMergeStatus] = useState<any>(null);
   const [mergeResolution, setMergeResolution] = useState<string>("1080p");
   const [mergeUploadBusy, setMergeUploadBusy] = useState(false);
   const [mergeUploadedDriveUrl, setMergeUploadedDriveUrl] = useState<string | null>(null);
+  const [mergeUploadedDriveDirectUrl, setMergeUploadedDriveDirectUrl] = useState<string | null>(null);
   
   // Load existing download data from localStorage
   useEffect(() => {
@@ -155,10 +228,28 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
   }, [projectId]);
 
   useEffect(() => {
-    if (!mergeJobId) {
-      setMergeStatus(null);
-      return;
+    if (!projectId) return;
+    try {
+      const raw = localStorage.getItem(mergeCacheKey(projectId));
+      if (raw) {
+        const cached = JSON.parse(raw);
+        if (cached?.status === "success" && cached.mergedVideoUrl) {
+          setMergeStatus(cached);
+        }
+      }
+      const driveRaw = localStorage.getItem(mergeDriveCacheKey(projectId));
+      if (driveRaw) {
+        const d = JSON.parse(driveRaw);
+        if (d?.view) setMergeUploadedDriveUrl(d.view);
+        if (d?.direct) setMergeUploadedDriveDirectUrl(d.direct);
+      }
+    } catch {
+      /* ignore */
     }
+  }, [projectId]);
+
+  useEffect(() => {
+    if (!mergeJobId || !projectId) return;
     let stopped = false;
     const poll = async () => {
       try {
@@ -167,7 +258,16 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
           { cache: "no-store", headers: { "Cache-Control": "no-cache" } }
         );
         const data = await res.json();
-        if (!stopped) setMergeStatus(data);
+        if (!stopped) {
+          setMergeStatus(data);
+          if (data.status === "success" && data.mergedVideoUrl) {
+            try {
+              localStorage.setItem(mergeCacheKey(projectId), JSON.stringify(data));
+            } catch {
+              /* ignore */
+            }
+          }
+        }
         return data.status === "success" || data.status === "error";
       } catch {
         return false;
@@ -182,12 +282,6 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
       clearInterval(interval);
     };
   }, [mergeJobId, projectId]);
-
-  useEffect(() => {
-    if (mergeStatus?.status !== "success") {
-      setMergeUploadedDriveUrl(null);
-    }
-  }, [mergeStatus?.status, mergeJobId]);
   
   const [folderLink, setFolderLink] = useState<string>("");
   const [loadingDriveConfig, setLoadingDriveConfig] = useState(true);
@@ -223,11 +317,6 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
     setSelectedFolderId(id);
   }, [folderLink]);
 
-  useEffect(() => {
-    const timer = setInterval(() => setCurrentTime(new Date()), 1000);
-    return () => clearInterval(timer);
-  }, []);
-
   const handleLinkChange = async (link: string) => {
      setFolderLink(link);
      try {
@@ -247,7 +336,24 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
     onMergeJobClear?.();
     setMergeStatus(null);
     setMergeUploadedDriveUrl(null);
+    setMergeUploadedDriveDirectUrl(null);
+    if (projectId) {
+      try {
+        localStorage.removeItem(mergeCacheKey(projectId));
+        localStorage.removeItem(mergeDriveCacheKey(projectId));
+      } catch {
+        /* ignore */
+      }
+    }
   };
+
+  const mergeInProgress =
+    !!mergeJobId &&
+    mergeStatus &&
+    mergeStatus.status !== "success" &&
+    mergeStatus.status !== "error";
+
+  const mergeSucceeded = mergeStatus?.status === "success" && !!mergeStatus?.mergedVideoUrl;
 
   const handleDownloadMergedLocal = () => {
     const base = mergedExportBasenameFromUrl(mergeStatus?.mergedVideoUrl);
@@ -272,7 +378,6 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
       return;
     }
     setMergeUploadBusy(true);
-    setMergeUploadedDriveUrl(null);
     try {
       const res = await fetch("/api/drive/upload-merged", {
         method: "POST",
@@ -287,12 +392,26 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
       if (!res.ok) {
         throw new Error(typeof data.error === "string" ? data.error : `HTTP ${res.status}`);
       }
-      const link =
+      const viewLink =
         (data.webViewLink as string) ||
-        (data.webContentLink as string) ||
         (data.id ? `https://drive.google.com/file/d/${data.id}/view` : "");
-      if (link) setMergeUploadedDriveUrl(link);
-      else setNotifiError("Upload xong nhưng không nhận được link Drive.");
+      const directLink =
+        (data.webContentLink as string) ||
+        (data.id ? `https://drive.google.com/uc?export=download&id=${data.id}` : "");
+      if (viewLink || directLink) {
+        if (viewLink) setMergeUploadedDriveUrl(viewLink);
+        if (directLink) setMergeUploadedDriveDirectUrl(directLink);
+        if (projectId) {
+          try {
+            localStorage.setItem(
+              mergeDriveCacheKey(projectId),
+              JSON.stringify({ view: viewLink || null, direct: directLink || null }),
+            );
+          } catch {
+            /* ignore */
+          }
+        }
+      } else setNotifiError("Upload xong nhưng không nhận được link Drive.");
     } catch (e: any) {
       setNotifiError(e?.message || "Upload Drive thất bại.");
     } finally {
@@ -307,7 +426,7 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
         : "";
     const logs = jobs
       .filter(j => j.status !== "idle")
-      .map(j => `[${currentTime.toLocaleTimeString()}] INFO: Job ${j.id.substring(0, 8)} status changed to ${j.status.toUpperCase()}${j.error ? `\nERROR: ${j.error}` : ''}${j.driveLink ? `\nDRIVE: ${j.driveLink}` : ''}`)
+      .map(j => `[${new Date().toLocaleTimeString()}] INFO: Job ${j.id.substring(0, 8)} status changed to ${j.status.toUpperCase()}${j.error ? `\nERROR: ${j.error}` : ''}${j.driveLink ? `\nDRIVE: ${j.driveLink}` : ''}${j.driveDirectLink ? `\nDIRECT: ${j.driveDirectLink}` : ''}`)
       .join('\n');
     
     if (logs || mergeLines) {
@@ -522,64 +641,49 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
              </button>
           </div>
        )}
-       {mergeStatus?.status === 'success' && (
+       {mergeSucceeded && (
           <div className="bg-emerald-600 text-white px-4 py-2 text-[10px] font-bold uppercase flex flex-wrap items-center justify-center gap-2 sm:gap-3">
              <CheckCircle2 size={12} className="shrink-0" />
-             <span className="shrink-0">Merge Complete!</span>
-             {mergeStatus.mergedVideoUrl && (
-               <>
-                 <button
-                   type="button"
-                   onClick={handleDownloadMergedLocal}
-                   className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-800/80 hover:bg-emerald-900/90 text-[9px] font-bold uppercase border border-white/20"
-                 >
-                   <Download size={10} /> Tải về máy
-                 </button>
-                 <a
-                   href={mergeStatus.mergedVideoUrl}
-                   target="_blank"
-                   rel="noreferrer"
-                   className="inline-flex items-center gap-1 px-2 py-1 rounded bg-white/15 hover:bg-white/25 text-[9px] font-bold uppercase underline-offset-2"
-                 >
-                   <ExternalLink size={10} /> Mở trong tab
-                 </a>
-                 <button
-                   type="button"
-                   disabled={mergeUploadBusy || !config.driveAccessToken || !selectedFolderId}
-                   onClick={handleUploadMergedToDrive}
-                   title={
-                     !config.driveAccessToken
-                       ? "Kết nối Drive trong tab Auth Cookies"
-                       : !selectedFolderId
-                         ? "Nhập link folder Drive"
-                         : "Upload bản merge lên folder đã cấu hình"
-                   }
-                   className="inline-flex items-center gap-1 px-2 py-1 rounded bg-amber-500/90 hover:bg-amber-400 text-[#1a1a1a] text-[9px] font-bold uppercase disabled:opacity-50 disabled:cursor-not-allowed"
-                 >
-                   {mergeUploadBusy ? <Loader2 size={10} className="animate-spin" /> : <HardDrive size={10} />}
-                   {mergeUploadBusy ? "Đang upload…" : "Lên Drive"}
-                 </button>
-                 {mergeUploadedDriveUrl && (
-                   <>
-                     <a
-                       href={mergeUploadedDriveUrl}
-                       target="_blank"
-                       rel="noreferrer"
-                       className="inline-flex items-center gap-1 text-[9px] font-bold normal-case underline max-w-[200px] truncate"
-                     >
-                       Đã lên Drive — mở
-                     </a>
-                     <button
-                       type="button"
-                       onClick={() => navigator.clipboard.writeText(mergeUploadedDriveUrl)}
-                       className="inline-flex items-center gap-1 px-1 py-0.5 rounded bg-white/10 hover:bg-white/20"
-                       title="Copy link"
-                     >
-                       <Copy size={10} />
-                     </button>
-                   </>
-                 )}
-               </>
+             <span className="shrink-0 normal-case">Merge xong — tải / đẩy Drive bất cứ lúc nào</span>
+             <button
+               type="button"
+               onClick={handleDownloadMergedLocal}
+               className="inline-flex items-center gap-1 px-2 py-1 rounded bg-emerald-800/80 hover:bg-emerald-900/90 text-[9px] font-bold uppercase border border-white/20"
+             >
+               <Download size={10} /> Tải về máy
+             </button>
+             <a
+               href={mergeStatus.mergedVideoUrl}
+               target="_blank"
+               rel="noreferrer"
+               className="inline-flex items-center gap-1 px-2 py-1 rounded bg-white/15 hover:bg-white/25 text-[9px] font-bold uppercase underline-offset-2"
+             >
+               <ExternalLink size={10} /> Mở trên server
+             </a>
+             <button
+               type="button"
+               disabled={mergeUploadBusy || !config.driveAccessToken || !selectedFolderId}
+               onClick={handleUploadMergedToDrive}
+               title={
+                 !config.driveAccessToken
+                   ? "Kết nối Drive trong tab Auth Cookies"
+                   : !selectedFolderId
+                     ? "Nhập link folder Drive"
+                     : "Upload bản merge lên folder đã cấu hình"
+               }
+               className="inline-flex items-center gap-1 px-2 py-1 rounded bg-amber-500/90 hover:bg-amber-400 text-[#1a1a1a] text-[9px] font-bold uppercase disabled:opacity-50 disabled:cursor-not-allowed"
+             >
+               {mergeUploadBusy ? <Loader2 size={10} className="animate-spin" /> : <HardDrive size={10} />}
+               {mergeUploadBusy ? "Đang upload…" : "Lên Drive"}
+             </button>
+             {mergeUploadedDriveUrl && (
+               <span className="inline-flex items-center gap-1 [&_a]:text-white [&_a]:bg-white/15 [&_a]:hover:bg-white/25 [&_button]:text-white">
+                 <DriveLinkActions
+                   viewLink={mergeUploadedDriveUrl}
+                   directLink={mergeUploadedDriveDirectUrl}
+                   compact
+                 />
+               </span>
              )}
           </div>
        )}
@@ -618,10 +722,8 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
           <div className="w-px h-4 bg-[#b8b8b0]"></div>
           <div>Project ID: <span className="text-[#1a1a1a]">{projectId ? projectId.substring(0, 8) : "N/A"}...</span></div>
         </div>
-        <div className="flex items-center gap-6">
-          <div>Station Local Time: <span className="text-[#1a1a1a]">{currentTime.toLocaleTimeString()}</span></div>
-          <div className="flex gap-2">
-            {metrics.progress === 100 && metrics.total > 0 && (
+        <div className="flex items-center gap-2">
+            {(metrics.progress === 100 && metrics.total > 0) || mergeSucceeded ? (
               <>
                 <select
                   value={mergeResolution}
@@ -635,21 +737,20 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
                 </select>
                 <button 
                   onClick={() => onMerge?.(mergeResolution)}
-                  disabled={
-                    !mergeDriveReady ||
-                    (!!mergeJobId && (!mergeStatus || (mergeStatus.status !== "success" && mergeStatus.status !== "error")))
-                  }
+                  disabled={!mergeDriveReady || mergeInProgress}
                   title={
                     !mergeDriveReady
                       ? "Merge chỉ dùng bản gốc trên Drive. Chạy automation đến khi mọi clip upload xong (watermark chỉ để proxy trong Studio)."
-                      : "Ghép video từ file Drive đã upload"
+                      : mergeSucceeded
+                        ? "Ghép lại video final từ các clip trên Drive"
+                        : "Ghép video từ file Drive đã upload"
                   }
                   className="bg-indigo-600 text-white px-4 py-1 rounded hover:bg-indigo-700 transition-colors flex items-center gap-2 font-bold shadow-[0_0_15px_rgba(79,70,229,0.4)] disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  <MonitorPlay size={12} /> Merge Final Video
+                  <MonitorPlay size={12} /> {mergeSucceeded ? "Merge lại" : "Merge Final Video"}
                 </button>
               </>
-            )}
+            ) : null}
             {jobs.some(j => j.status === "downloading" || j.status === "uploading") && (
               <button 
                 onClick={handleStopAutomation}
@@ -672,7 +773,6 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
               <Zap size={12} fill="currentColor" /> Start Automation
             </button>
           </div>
-        </div>
       </div>
 
       <div className="flex-1 flex overflow-hidden">
@@ -705,6 +805,48 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
           <div className="flex-1 overflow-y-auto p-6 custom-scrollbar text-[#1a1a1a]">
             {activeSubTab === "queue" && (
               <div className="space-y-1">
+                {mergeSucceeded && (
+                  <div className="mb-6 p-4 rounded-lg border border-emerald-500/30 bg-emerald-500/5 space-y-3">
+                    <motion.div layout className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-emerald-800">
+                      <CheckCircle2 size={14} /> Video final đã merge
+                    </motion.div>
+                    <p className="text-[10px] text-[#4a4a40] normal-case">
+                      Queue và thao tác từng clip vẫn dùng được. Bạn có thể tải bản merge, mở trên server, hoặc đẩy lên Drive bất cứ lúc nào.
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleDownloadMergedLocal}
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded bg-[#1a1a1a] text-white text-[9px] font-bold uppercase hover:bg-[#333]"
+                      >
+                        <Download size={11} /> Tải về máy
+                      </button>
+                      <a
+                        href={mergeStatus.mergedVideoUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded border border-[#b8b8b0] bg-[#d8d8d4] text-[9px] font-bold uppercase hover:bg-[#cacac5]"
+                      >
+                        <ExternalLink size={11} /> Mở trên server
+                      </a>
+                      <button
+                        type="button"
+                        disabled={mergeUploadBusy || !config.driveAccessToken || !selectedFolderId}
+                        onClick={handleUploadMergedToDrive}
+                        className="inline-flex items-center gap-1 px-3 py-1.5 rounded bg-indigo-600 text-white text-[9px] font-bold uppercase hover:bg-indigo-700 disabled:opacity-50"
+                      >
+                        {mergeUploadBusy ? <Loader2 size={11} className="animate-spin" /> : <HardDrive size={11} />}
+                        Lên Drive
+                      </button>
+                      {mergeUploadedDriveUrl && (
+                        <DriveLinkActions
+                          viewLink={mergeUploadedDriveUrl}
+                          directLink={mergeUploadedDriveDirectUrl}
+                        />
+                      )}
+                    </div>
+                  </div>
+                )}
                 <div className="grid grid-cols-12 gap-4 text-[10px] font-bold text-[#6a6a60] uppercase tracking-tighter pb-2 border-b border-[#b8b8b0] mb-4">
                   <div className="col-span-6">Source Entity</div>
                   <div className="col-span-2">Time</div>
@@ -741,20 +883,15 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
                          {job?.status === "downloading" && <span className="text-[9px] font-bold text-blue-600 animate-pulse">DOWNLOADING</span>}
                          {job?.status === "uploading" && <span className="text-[9px] font-bold text-amber-600 animate-pulse">UPLOADING</span>}
                          {job?.status === "success" && (
-                            <div className="flex items-center gap-2">
+                            <motion.div layout className="flex flex-col items-end gap-1">
                               <span className="text-[9px] font-bold text-emerald-600">SUCCESS</span>
-                              {job.driveLink && (
-                                <a 
-                                  href={job.driveLink} 
-                                  target="_blank" 
-                                  rel="noreferrer" 
-                                  className="flex items-center gap-1 bg-emerald-100 hover:bg-emerald-200 text-emerald-800 px-2 py-0.5 rounded text-[8px] font-bold transition-colors"
-                                >
-                                  <ExternalLink size={10} />
-                                  VIEW DRIVE
-                                </a>
+                              {(job.driveLink || job.driveFileId) && (
+                                <DriveLinkActions
+                                  viewLink={job.driveLink}
+                                  directLink={resolveDriveDirectLink(job)}
+                                />
                               )}
-                            </div>
+                            </motion.div>
                          )}
                          {job?.status === "error" && <span className="text-[9px] font-bold text-red-600" title={job.error}>FAILED</span>}
                          {!job && <span className="text-[9px] font-bold text-[#8a8a80]">IDLE</span>}
@@ -890,7 +1027,7 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
                    {mergeJobId && (mergeStatus?.logs?.length > 0 || mergeStatus?.error) && (
                       <div key="merge-logs" className="mb-3 border-l border-amber-500/40 pl-3">
                          <div className="flex items-center gap-2 mb-1">
-                            <span className="opacity-40">[{currentTime.toLocaleTimeString()}]</span>
+                            <span className="opacity-40">[{new Date().toLocaleTimeString()}]</span>
                             <span className="text-amber-400 font-bold">MERGE:</span>
                             <span className="text-amber-200 font-mono text-[9px]">{mergeJobId}</span>
                          </div>
@@ -908,7 +1045,7 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
                       return (
                         <div key={`log-${j.id}`} className="mb-2 border-l border-emerald-500/10 pl-3">
                            <div className="flex items-center gap-2">
-                              <span className="opacity-40">[{currentTime.toLocaleTimeString()}]</span> 
+                              <span className="opacity-40">[{new Date().toLocaleTimeString()}]</span> 
                               <span className={`${j.status === 'error' ? 'text-red-400' : 'text-blue-400'} font-bold`}>{j.status === 'error' ? 'FAIL:' : 'INFO:'}</span> 
                               Job <span className="text-amber-400">{j.id.substring(0, 8)}</span>: <span className="uppercase font-bold underline">{j.status}</span>
                            </div>
@@ -918,6 +1055,7 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
                              </div>
                            )}
                            {j.driveLink && <div className="ml-4 text-emerald-400 font-bold bg-emerald-400/5 p-1 rounded mt-1">SYNC: {j.driveLink}</div>}
+                           {j.driveDirectLink && <div className="ml-4 text-indigo-300 font-bold bg-indigo-400/5 p-1 rounded mt-1">DIRECT: {j.driveDirectLink}</div>}
                            {j.diagnostic && j.status !== 'error' && <div className="ml-4 text-[9px] text-blue-300 opacity-60 italic">→ {j.diagnostic}</div>}
                         </div>
                       )
@@ -1019,6 +1157,40 @@ export function AutomationDownloader({ projectId, scenes, config, onConnectDrive
                </div>
             </div>
           </div>
+
+          {mergeSucceeded && (
+            <div>
+              <h3 className="text-[10px] font-bold uppercase tracking-widest text-[#6a6a60] mb-4 pb-1 border-b border-[#b8b8b0]">Final merged output</h3>
+              <div className="bg-[#d8d8d4] p-4 border border-[#b8b8b0] rounded-lg space-y-3">
+                <p className="text-[9px] text-[#4a4a40] normal-case leading-relaxed">
+                  Tải local, mở trên server, hoặc upload lên Drive — link direct hiện sau khi upload.
+                </p>
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={handleDownloadMergedLocal}
+                    className="text-[9px] font-bold uppercase px-2 py-1 bg-[#1a1a1a] text-white rounded hover:bg-[#333]"
+                  >
+                    Tải về
+                  </button>
+                  <button
+                    type="button"
+                    disabled={mergeUploadBusy || !config.driveAccessToken || !selectedFolderId}
+                    onClick={handleUploadMergedToDrive}
+                    className="text-[9px] font-bold uppercase px-2 py-1 bg-indigo-600 text-white rounded hover:bg-indigo-700 disabled:opacity-50"
+                  >
+                    Lên Drive
+                  </button>
+                </div>
+                {mergeUploadedDriveUrl && (
+                  <DriveLinkActions
+                    viewLink={mergeUploadedDriveUrl}
+                    directLink={mergeUploadedDriveDirectUrl}
+                  />
+                )}
+              </div>
+            </div>
+          )}
 
           <div className="mt-auto">
             <h3 className="text-[10px] font-bold uppercase tracking-widest text-[#6a6a60] mb-4 pb-1 border-b border-[#b8b8b0]">Cloud Sync: Google Drive</h3>
