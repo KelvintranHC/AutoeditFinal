@@ -418,6 +418,26 @@ export function AutomationDownloader({
   const mergeDriveReady = useMemo(() => {
     if (!scenes?.length) return false;
     const seen = new Set<string>();
+    const clipHasDrive = (v: {
+      url?: string;
+      stockUrl?: string;
+      driveFileId?: string;
+      driveLink?: string;
+      driveDirectLink?: string;
+    }) => {
+      if (resolveDriveFileIdForVideo(v)) return true;
+      const job = jobs.find(
+        (j) =>
+          j.status === "success" &&
+          (j.id === v.url || j.stockUrl === v.stockUrl),
+      );
+      if (!job) return false;
+      return !!resolveDriveFileIdForVideo({
+        driveFileId: job.driveFileId,
+        driveLink: job.driveLink,
+        driveDirectLink: job.driveDirectLink,
+      });
+    };
     for (const scene of scenes) {
       const sVids =
         scene.selectedVideos && scene.selectedVideos.length > 0
@@ -430,11 +450,43 @@ export function AutomationDownloader({
         const key = (v.url || v.stockUrl) as string;
         if (seen.has(key)) continue;
         seen.add(key);
-        if (!resolveDriveFileIdForVideo(v)) return false;
+        if (!clipHasDrive(v)) return false;
       }
     }
     return seen.size > 0;
-  }, [scenes]);
+  }, [scenes, jobs]);
+
+  /** Phục hồi driveLink/driveFileId trên scenes từ queue (sau bug ghi đè hoặc reload). */
+  useEffect(() => {
+    if (!scenes?.length || !jobs.length || !onUpdateScenes) return;
+    const newScenes = JSON.parse(JSON.stringify(scenes)) as typeof scenes;
+    let changed = false;
+    for (const job of jobs) {
+      if (job.status !== "success") continue;
+      const jobId = resolveDriveFileIdForVideo({
+        driveFileId: job.driveFileId,
+        driveLink: job.driveLink,
+        driveDirectLink: job.driveDirectLink,
+      });
+      if (!jobId) continue;
+      for (const scene of newScenes) {
+        if (!scene.videos) continue;
+        for (const v of scene.videos) {
+          if (v.url !== job.id && v.stockUrl !== job.stockUrl) continue;
+          const cur = resolveDriveFileIdForVideo(v);
+          if (!cur || cur !== jobId) {
+            v.driveLink = job.driveLink || v.driveLink;
+            v.driveFileId = job.driveFileId || jobId;
+            if (job.driveDirectLink) v.driveDirectLink = job.driveDirectLink;
+            changed = true;
+          }
+        }
+      }
+    }
+    if (changed) {
+      onUpdateScenes(newScenes);
+    }
+  }, [jobs, scenes, onUpdateScenes]);
 
   useEffect(() => {
     if (!projectId) return;
@@ -444,45 +496,71 @@ export function AutomationDownloader({
         const data = JSON.parse(event.data);
         if (data.jobs) {
            setJobs(prevJobs => {
-              // Check for success transitions to update scenes
-              data.jobs.forEach((newJob: any) => {
-                 const oldJob = prevJobs.find(j => j.id === newJob.id);
-                 if (newJob.status === "success" && (!oldJob || oldJob.status !== "success")) {
-                    console.log(`Job ${newJob.id} succeeded. Updating scenes with drive info.`);
-                    try {
-                       const localCache = JSON.parse(localStorage.getItem("local_video_downloads") || "{}");
-                       localCache[newJob.stockUrl || newJob.id] = { driveLink: newJob.driveLink, createdAt: new Date().toISOString() };
-                       localStorage.setItem("local_video_downloads", JSON.stringify(localCache));
-                    } catch(e) { console.error(e) }
-                    // Find which scene this belongs to and update it
-                    const newScenes = JSON.parse(JSON.stringify(scenes));
-                    let updated = false;
-                    newScenes.forEach((scene: any) => {
-                       if (scene.videos) {
-                          scene.videos.forEach((v: any) => {
-                             if (v.url === newJob.id || v.stockUrl === newJob.stockUrl) {
-                                v.driveLink = newJob.driveLink;
-                                v.driveFileId =
-                                  newJob.driveFileId ||
-                                  resolveDriveFileIdForVideo({ driveLink: newJob.driveLink }) ||
-                                  v.driveFileId;
-                                updated = true;
-                             }
-                          });
-                       }
-                    });
-                    if (updated && onUpdateScenes) {
-                       // Asynchronous update to avoid React "update while rendering" warning
-                       setTimeout(() => onUpdateScenes(newScenes), 0);
-                    }
-                 }
-              });
+              const newScenes = JSON.parse(JSON.stringify(scenes));
+              let scenesMutated = false;
 
-              // Compare check to see if we just got a new error
-              const hadError = prevJobs.some((j: any) => j.status === 'error');
-              const hasErrorNow = data.jobs.filter((j: any) => j.status === 'error' && j.error);
+              for (const newJob of data.jobs as Job[]) {
+                if (newJob.status !== "success") continue;
+                const oldJob = prevJobs.find((j) => j.id === newJob.id);
+                const transitioned =
+                  !oldJob || oldJob.status !== "success";
+                const jobDriveId = resolveDriveFileIdForVideo({
+                  driveFileId: newJob.driveFileId,
+                  driveLink: newJob.driveLink,
+                  driveDirectLink: newJob.driveDirectLink,
+                });
+                if (!jobDriveId) continue;
+
+                for (const scene of newScenes) {
+                  if (!scene.videos) continue;
+                  for (const v of scene.videos) {
+                    if (v.url !== newJob.id && v.stockUrl !== newJob.stockUrl) {
+                      continue;
+                    }
+                    const cur = resolveDriveFileIdForVideo(v);
+                    if (cur !== jobDriveId) {
+                      v.driveLink = newJob.driveLink || v.driveLink;
+                      v.driveFileId = newJob.driveFileId || jobDriveId;
+                      if (newJob.driveDirectLink) {
+                        v.driveDirectLink = newJob.driveDirectLink;
+                      }
+                      scenesMutated = true;
+                    }
+                  }
+                }
+
+                if (transitioned) {
+                  try {
+                    const localCache = JSON.parse(
+                      localStorage.getItem("local_video_downloads") || "{}",
+                    );
+                    localCache[newJob.stockUrl || newJob.id] = {
+                      driveLink: newJob.driveLink,
+                      createdAt: new Date().toISOString(),
+                    };
+                    localStorage.setItem(
+                      "local_video_downloads",
+                      JSON.stringify(localCache),
+                    );
+                  } catch (e) {
+                    console.error(e);
+                  }
+                  console.log(
+                    `Job ${newJob.id} succeeded. Updated scenes with Drive info (batched).`,
+                  );
+                }
+              }
+
+              if (scenesMutated && onUpdateScenes) {
+                setTimeout(() => onUpdateScenes(newScenes), 0);
+              }
+
+              const hadError = prevJobs.some((j: Job) => j.status === "error");
+              const hasErrorNow = data.jobs.filter(
+                (j: Job) => j.status === "error" && j.error,
+              );
               if (!hadError && hasErrorNow.length > 0) {
-                 const rootError = hasErrorNow.find((j: any) => j.error && !j.error.includes("AUTO_STOP")) || hasErrorNow[0];
+                 const rootError = hasErrorNow.find((j: Job) => j.error && !j.error.includes("AUTO_STOP")) || hasErrorNow[0];
                  setNotifiError(`Hệ thống tự động dừng: ${rootError.error}`);
               }
               return data.jobs;

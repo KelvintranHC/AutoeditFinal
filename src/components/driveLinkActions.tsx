@@ -1,17 +1,31 @@
 import { Copy, ExternalLink, Link2 } from "lucide-react";
 
+/** Khớp logic server `extractGoogleDriveFileId` — hỗ trợ id thuần, /file/d/, ?id=. */
+export function extractGoogleDriveFileIdClient(
+  input: string | undefined | null,
+): string | null {
+  if (input == null || typeof input !== "string") return null;
+  const s = input.trim();
+  if (!s) return null;
+  if (!/[/?]/.test(s) && /^[a-zA-Z0-9_-]{10,100}$/.test(s)) return s;
+  const d = s.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
+  if (d) return d[1];
+  const idq = s.match(/[?&]id=([a-zA-Z0-9_-]+)/);
+  if (idq) return idq[1];
+  return null;
+}
+
 export function resolveDriveFileIdForVideo(v: {
   driveFileId?: string;
   driveLink?: string;
+  driveDirectLink?: string;
 }): string | null {
   const raw = v.driveFileId && String(v.driveFileId).trim();
   if (raw) return raw;
-  const link = v.driveLink;
-  if (!link || typeof link !== "string") return null;
-  const m = link.match(/\/file\/d\/([a-zA-Z0-9_-]+)/);
-  if (m) return m[1];
-  const m2 = link.match(/[?&]id=([a-zA-Z0-9_-]+)/);
-  if (m2) return m2[1];
+  const fromView = extractGoogleDriveFileIdClient(v.driveLink);
+  if (fromView) return fromView;
+  const fromDirect = extractGoogleDriveFileIdClient(v.driveDirectLink);
+  if (fromDirect) return fromDirect;
   return null;
 }
 
