@@ -147,6 +147,14 @@ export function mergeTimedChunksIntoSentenceSrt(
   return formatSrtFromSentenceBlocks(sentences);
 }
 
+/** Gỡ markdown fence / text thừa từ output Gemini trước khi parse SRT. */
+export function sanitizeGeminiSrtOutput(raw: string): string {
+  let t = (raw || "").trim().replace(/^\uFEFF/, "");
+  const fenced = t.match(/^```(?:srt|text)?\s*\r?\n?([\s\S]*?)```\s*$/i);
+  if (fenced) t = fenced[1].trim();
+  return t;
+}
+
 /** Chuẩn hóa file SRT có sẵn: gom cue ngắn thành block theo câu. */
 export function mergeSrtCuesIntoSentenceBlocks(srt: string): string {
   const trimmed = (srt || "").trim();

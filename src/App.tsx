@@ -113,7 +113,10 @@ import {
   saveUserConfigApi,
   updateProjectApi,
 } from "./lib/projectApi";
-import { mergeSrtCuesIntoSentenceBlocks } from "../lib/srtSentenceFormatting";
+import {
+  mergeSrtCuesIntoSentenceBlocks,
+  sanitizeGeminiSrtOutput,
+} from "../lib/srtSentenceFormatting";
 import {
   type Project,
   type UserAppConfig,
@@ -816,6 +819,10 @@ export default function App() {
   const [editingProjectTitle, setEditingProjectTitle] = useState("");
 
   const [script, setScript] = useState("");
+  const scriptRef = React.useRef(script);
+  scriptRef.current = script;
+  /** Chỉ hydrate state từ server khi đổi project — tránh ghi đè SRT sau lưu token. */
+  const lastHydratedProjectIdRef = React.useRef<string | null>(null);
   const [tokenUsageLog, setTokenUsageLog] = useState<ProjectTokenUsageLog>(
     emptyTokenUsageLog(),
   );
@@ -874,7 +881,17 @@ export default function App() {
           tokenUsageJson: JSON.stringify(log),
         });
         setProjects((prev) =>
-          prev.map((p) => (p.id === selectedProjectId ? updated : p)),
+          prev.map((p) => {
+            if (p.id !== selectedProjectId) return p;
+            return {
+              ...updated,
+              script: scriptRef.current || updated.script || p.script,
+              scenes:
+                scenesRef.current.length > 0
+                  ? JSON.stringify(scenesRef.current)
+                  : updated.scenes || p.scenes,
+            };
+          }),
         );
       } catch (e) {
         console.warn("[token] persist failed", e);
@@ -1205,7 +1222,7 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
     });
 
     try {
-      const rawSrt = await transcribeAudio(file);
+      const rawSrt = sanitizeGeminiSrtOutput(await transcribeAudio(file));
 
       if (!rawSrt || rawSrt.length < 10) {
         throw new Error("Không thể trích xuất phụ đề từ âm thanh này.");
@@ -1213,6 +1230,16 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
 
       const tNorm0 = performance.now();
       const srtContent = mergeSrtCuesIntoSentenceBlocks(rawSrt);
+      if (!srtContent || srtContent.length < 5) {
+        throw new Error("Không tạo được SRT hợp lệ từ kết quả transcribe.");
+      }
+
+      setUploadedAudioFile(file);
+      setScript(srtContent);
+      setIsDirty(true);
+      setViewMode("editor");
+      setActiveTab("script");
+
       setTokenUsageLog((prev) => {
         const next = recordLocalProcessingStep(prev, "srt_sentence_normalize", {
           note: "Gom cue SRT theo câu hoàn chỉnh (local)",
@@ -1222,8 +1249,10 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
         return next;
       });
 
-      setUploadedAudioFile(file);
-      setScript(srtContent);
+      if (selectedProjectId) {
+        void saveProjectState(srtContent, scenesRef.current);
+      }
+
       toast.success("Đã tạo phụ đề từ âm thanh!", { id: "transcribing" });
 
       // Auto trigger process
@@ -1352,43 +1381,10 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
     };
   }, []);
 
-  // Load selected project
+  // Load selected project — chỉ khi đổi projectId (không reload khi projects patch token/script)
   useEffect(() => {
-    const proj = projects.find((p) => p.id === selectedProjectId);
-    if (proj) {
-      setScript(proj.script || "");
-      try {
-        setScenes(proj.scenes ? JSON.parse(proj.scenes) : []);
-      } catch (e) {
-        console.error("Failed to parse scenes", e);
-        setScenes([]);
-      }
-      setVisualKeywordDirection(proj.visualKeywordDirection || "");
-      try {
-        if (proj.pacingProfileJson) {
-          const parsed = JSON.parse(proj.pacingProfileJson);
-          setPacingProfile(
-            normalizePacingProfile({ ...DEFAULT_PACING_PROFILE, ...parsed }),
-          );
-        } else {
-          setPacingProfile({ ...DEFAULT_PACING_PROFILE });
-        }
-      } catch {
-        setPacingProfile({ ...DEFAULT_PACING_PROFILE });
-      }
-      const persistedAudio = proj.audioUrl;
-      if (persistedAudio && /^https?:\/\//i.test(persistedAudio)) {
-        setAudioUrl(persistedAudio);
-      } else {
-        setAudioUrl(null);
-      }
-      setDownloadUrl(proj.downloadUrl || null);
-      setSceneMergeSelection([]);
-      setTokenUsageLog({
-        ...parseTokenUsageLog(proj.tokenUsageJson),
-        projectId: proj.id,
-      });
-    } else {
+    if (!selectedProjectId) {
+      lastHydratedProjectIdRef.current = null;
       setScript("");
       setScenes([]);
       setSceneMergeSelection([]);
@@ -1397,7 +1393,50 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
       setAudioUrl(null);
       setDownloadUrl(null);
       setTokenUsageLog(emptyTokenUsageLog());
+      return;
     }
+
+    const proj = projects.find((p) => p.id === selectedProjectId);
+    if (!proj) return;
+
+    const switched = lastHydratedProjectIdRef.current !== selectedProjectId;
+    if (!switched) return;
+
+    lastHydratedProjectIdRef.current = selectedProjectId;
+
+    setScript(proj.script || "");
+    try {
+      setScenes(proj.scenes ? JSON.parse(proj.scenes) : []);
+    } catch (e) {
+      console.error("Failed to parse scenes", e);
+      setScenes([]);
+    }
+    setVisualKeywordDirection(proj.visualKeywordDirection || "");
+    try {
+      if (proj.pacingProfileJson) {
+        const parsed = JSON.parse(proj.pacingProfileJson);
+        setPacingProfile(
+          normalizePacingProfile({ ...DEFAULT_PACING_PROFILE, ...parsed }),
+        );
+      } else {
+        setPacingProfile({ ...DEFAULT_PACING_PROFILE });
+      }
+    } catch {
+      setPacingProfile({ ...DEFAULT_PACING_PROFILE });
+    }
+    const persistedAudio = proj.audioUrl;
+    if (persistedAudio && /^https?:\/\//i.test(persistedAudio)) {
+      setAudioUrl(persistedAudio);
+    } else {
+      setAudioUrl(null);
+    }
+    setDownloadUrl(proj.downloadUrl || null);
+    setSceneMergeSelection([]);
+    setTokenUsageLog({
+      ...parseTokenUsageLog(proj.tokenUsageJson),
+      projectId: proj.id,
+    });
+    setIsDirty(false);
   }, [selectedProjectId, projects]);
 
   const handleCreateProject = async (e: React.FormEvent) => {
@@ -1709,12 +1748,13 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
   };
 
   const handleProcessScript = async () => {
-    if (!script.trim()) return;
+    const scriptText = scriptRef.current;
+    if (!scriptText.trim()) return;
 
     // Early check if AI is needed but missing
     const isSRT =
       /^\d+\s*\n\d{2}:\d{2}:\d{2},\d{3}\s*-->\s*\d{2}:\d{2}:\d{2},\d{3}/m.test(
-        script,
+        scriptText,
       );
 
     if (!ai && isSRT) {
@@ -1729,7 +1769,7 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
 
       if (isSRT) {
         toast.loading("Đang phân tích SRT bằng code...", { id: "analyze-srt" });
-        const srtCues = parseSRT(script);
+        const srtCues = parseSRT(scriptText);
         if (srtCues.length === 0)
           throw new Error("File SRT không hợp lệ hoặc rỗng.");
 
@@ -1936,7 +1976,7 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
           console.warn(
             "Gemini API Key chưa được thiết lập. Sử dụng danh sách trực tiếp.",
           );
-          const lines = script
+          const lines = scriptText
             .split("\n")
             .map((l) => l.trim())
             .filter(Boolean);
@@ -1951,7 +1991,7 @@ Chỉ trả về nội dung SRT thuần (số thứ tự, timecode, text), khôn
 Chủ đề: News, Politics, Military, Charts.
 Nguyên tắc: subjet + action, ngắn gọn 2-4 từ.
 Chỉ trả về JSON: {"scenes": [{"id": 1, "text": "...", "keyword": "..."}]}
-Văn bản: ${script}`;
+Văn bản: ${scriptText}`;
 
           try {
             const result = await recordGeminiStep(
@@ -1993,7 +2033,7 @@ Văn bản: ${script}`;
                 resultText,
                 "Falling back to directly mapped lines.",
               );
-              const lines = script
+              const lines = scriptText
                 .split("\n")
                 .map((l) => l.trim())
                 .filter(Boolean);
@@ -2008,7 +2048,7 @@ Văn bản: ${script}`;
             toast.error(
               "Lỗi AI khi phân tích, sử dụng câu text gốc làm keyword.",
             );
-            const lines = script
+            const lines = scriptText
               .split("\n")
               .map((l) => l.trim())
               .filter(Boolean);
