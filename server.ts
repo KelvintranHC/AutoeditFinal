@@ -599,6 +599,7 @@ function getBrowserExecutablePath() {
 }
 
 import { registerProjectRoutes } from "./lib/projectRoutes.js";
+import { updateProject } from "./lib/projectStore.js";
 import { registerAppAuthRoutes } from "./lib/appAuthRoutes.js";
 
 const app = express();
@@ -3733,13 +3734,23 @@ app.post("/api/projects/:projectId/merge", upload.single("audio"), async (req, r
       appendMergeLog(mergeJobId, `Hoàn thành — ${finalSizeMB} MB`);
       console.log(`[Merge] ✅ Output: ${outputPath} (${finalSizeMB} MB)`);
 
+      const mergedVideoUrl = `/exports/${outputFilename}`;
       updateJob({
         status: "done",
         phase: "done",
         progress: 100,
         current: `Hoàn thành! ${finalSizeMB} MB`,
-        downloadUrl: `/exports/${outputFilename}`,
+        downloadUrl: mergedVideoUrl,
       });
+      try {
+        updateProject(projectId, {
+          mergedVideoUrl,
+          mergedAt: new Date().toISOString(),
+          status: "completed",
+        });
+      } catch (storeErr) {
+        console.warn("[Merge] Could not persist merge output to project:", storeErr);
+      }
     } catch (error: any) {
       console.error(`[Merge] Job ${mergeJobId} failed:`, error);
       const msg = error?.message || String(error);

@@ -15,8 +15,29 @@ export interface StoredProject {
   pacingProfileJson?: string;
   audioUrl?: string | null;
   downloadUrl?: string | null;
+  /** URL export merge final (vd. /exports/drive_merge_mj_….mp4) — theo từng project. */
+  mergedVideoUrl?: string | null;
+  mergedAt?: string | null;
+  mergeDriveViewUrl?: string | null;
+  mergeDriveDirectUrl?: string | null;
+  status?: "editing" | "completed";
   createdAt: string;
   updatedAt: string;
+}
+
+function normalizeStoredProject(p: StoredProject): StoredProject {
+  const status =
+    p.status === "completed" || p.status === "editing"
+      ? p.status
+      : p.mergedVideoUrl
+        ? "completed"
+        : "editing";
+  return {
+    ...p,
+    status,
+    createdAt: p.createdAt || new Date().toISOString(),
+    updatedAt: p.updatedAt || p.createdAt || new Date().toISOString(),
+  };
 }
 
 export interface UserAppConfigPayload {
@@ -77,7 +98,7 @@ export function listAllProjects(): StoredProject[] {
   const projects: StoredProject[] = [];
   for (const file of listAllProjectFiles()) {
     const p = readJsonFile<StoredProject>(file);
-    if (p) projects.push(p);
+    if (p) projects.push(normalizeStoredProject(p));
   }
   projects.sort(
     (a, b) =>
@@ -88,7 +109,8 @@ export function listAllProjects(): StoredProject[] {
 }
 
 export function getProject(projectId: string): StoredProject | null {
-  return readJsonFile<StoredProject>(projectFilePath(projectId));
+  const p = readJsonFile<StoredProject>(projectFilePath(projectId));
+  return p ? normalizeStoredProject(p) : null;
 }
 
 export function createProject(
@@ -107,6 +129,11 @@ export function createProject(
     pacingProfileJson: input.pacingProfileJson ?? "",
     audioUrl: input.audioUrl ?? null,
     downloadUrl: input.downloadUrl ?? null,
+    mergedVideoUrl: null,
+    mergedAt: null,
+    mergeDriveViewUrl: null,
+    mergeDriveDirectUrl: null,
+    status: "editing",
     createdAt: now,
     updatedAt: now,
   };
@@ -126,19 +153,24 @@ export function updateProject(
       | "pacingProfileJson"
       | "audioUrl"
       | "downloadUrl"
+      | "mergedVideoUrl"
+      | "mergedAt"
+      | "mergeDriveViewUrl"
+      | "mergeDriveDirectUrl"
+      | "status"
     >
   >,
 ): StoredProject | null {
   const existing = getProject(projectId);
   if (!existing) return null;
-  const updated: StoredProject = {
+  const updated: StoredProject = normalizeStoredProject({
     ...existing,
     ...patch,
     id: existing.id,
     userId: existing.userId,
     createdAt: existing.createdAt,
     updatedAt: new Date().toISOString(),
-  };
+  });
   writeJsonFile(projectFilePath(projectId), updated);
   return updated;
 }
@@ -171,6 +203,16 @@ export function migrateProjects(
       pacingProfileJson: raw.pacingProfileJson ?? "",
       audioUrl: raw.audioUrl ?? null,
       downloadUrl: raw.downloadUrl ?? null,
+      mergedVideoUrl: raw.mergedVideoUrl ?? null,
+      mergedAt: raw.mergedAt ?? null,
+      mergeDriveViewUrl: raw.mergeDriveViewUrl ?? null,
+      mergeDriveDirectUrl: raw.mergeDriveDirectUrl ?? null,
+      status:
+        raw.status === "completed" || raw.status === "editing"
+          ? raw.status
+          : raw.mergedVideoUrl
+            ? "completed"
+            : "editing",
       createdAt: raw.createdAt || new Date().toISOString(),
       updatedAt: raw.updatedAt || new Date().toISOString(),
     };

@@ -92,6 +92,24 @@ export function registerProjectRoutes(app: Express) {
     }
     if (patch.audioUrl !== undefined) allowed.audioUrl = patch.audioUrl;
     if (patch.downloadUrl !== undefined) allowed.downloadUrl = patch.downloadUrl;
+    if (patch.mergedVideoUrl !== undefined) {
+      allowed.mergedVideoUrl =
+        patch.mergedVideoUrl === null ? null : String(patch.mergedVideoUrl);
+    }
+    if (patch.mergedAt !== undefined) {
+      allowed.mergedAt = patch.mergedAt === null ? null : String(patch.mergedAt);
+    }
+    if (patch.mergeDriveViewUrl !== undefined) {
+      allowed.mergeDriveViewUrl =
+        patch.mergeDriveViewUrl === null ? null : String(patch.mergeDriveViewUrl);
+    }
+    if (patch.mergeDriveDirectUrl !== undefined) {
+      allowed.mergeDriveDirectUrl =
+        patch.mergeDriveDirectUrl === null ? null : String(patch.mergeDriveDirectUrl);
+    }
+    if (patch.status === "editing" || patch.status === "completed") {
+      allowed.status = patch.status;
+    }
     const updated = updateProject(req.params.projectId, allowed);
     if (!updated) {
       return res.status(404).json({ error: "Project không tồn tại." });

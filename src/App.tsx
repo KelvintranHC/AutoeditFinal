@@ -27,10 +27,11 @@ import {
   Activity,
   DownloadCloud,
   Palette,
+  GitMerge,
+  Sparkles,
 } from "lucide-react";
 import * as motion from "motion/react-client";
 import { GoogleGenAI, Type } from "@google/genai";
-import * as XLSX from "xlsx";
 import axios from "axios";
 
 import { db, handleFirestoreError, OperationType } from "./lib/firebase";
@@ -54,14 +55,29 @@ import { Toaster, toast } from "react-hot-toast";
 import { AutomationDownloader } from "./components/AutomationDownloader";
 import {
   DEFAULT_PACING_PROFILE,
+  PACING_TOTAL_CLIPS_ABSOLUTE_MAX,
+  PACING_TOTAL_CLIPS_ABSOLUTE_MIN,
+  clampTotalClipsRange,
+  normalizePacingProfile,
   type PacingProfile,
   blocksToSubtitleBlocks,
   buildMeaningBeatsPrompt,
   buildSceneKeywordsPrompt,
+  buildVietnameseSceneNotesPrompt,
+  detectSubtitleLangHint,
+  parseVietnameseSceneNotes,
+  mergeKeywordPlansWithDrafts,
   mergeMeaningBeatsToVisualScenes,
   normalizeSceneSelectedVideos,
   parseKeywordPlans,
+  plansLookGeneric,
   rankStockVideos,
+  ruleBasedMeaningBeats,
+  mergeEditorScenesAtIndices,
+  visualDraftFromEditorScene,
+  primaryKeywordFromPlan,
+  validateSrtSceneTextIntegrity,
+  topStoryblocksKeywordsForScene,
 } from "./scenePlanning";
 import { buildGeminiJsonConfig } from "./geminiConfig";
 import {
@@ -83,6 +99,8 @@ import {
 import {
   type Project,
   type UserAppConfig,
+  formatProjectCreatedAtVi,
+  resolveProjectStatus,
   LEGACY_CONFIG_STORAGE_KEY,
   LEGACY_PROJECTS_STORAGE_KEY,
 } from "./lib/projectTypes";
@@ -148,11 +166,13 @@ interface Scene {
     duration: number; // Duration in seconds (endTime - startTime của cụm SRT)
     keywords: string[];
     fallbackKeywords?: string[];
-    avoidTerms?: string[];
     storyblocksSearchQueries?: string[];
     summaryVi?: string;
     pacingZone?: "hook" | "body" | "ending";
   };
+  /** Scene được gộp thủ công từ nhiều scene gốc */
+  isMerged?: boolean;
+  mergedFromIds?: number[];
 }
 
 // Cache for storyblocks
@@ -175,6 +195,39 @@ function formatSRTTime(seconds: number): string {
   const s = Math.floor(seconds % 60);
   const ms = Math.floor((seconds % 1) * 1000);
   return `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")},${ms.toString().padStart(3, "0")}`;
+}
+
+/** Hiển thị tổng thời lượng timeline (vd. «1 phút 30s», «45s»). */
+function formatTimelineDurationVi(totalSec: number): string {
+  const sec = Math.max(0, Math.round(totalSec * 10) / 10);
+  const mins = Math.floor(sec / 60);
+  const rem = Math.round((sec % 60) * 10) / 10;
+  const remLabel =
+    rem % 1 === 0 ? `${Math.round(rem)}` : `${rem}`.replace(/\.0$/, "");
+  if (mins <= 0) return `${remLabel}s`;
+  if (rem < 0.05) return `${mins} phút`;
+  return `${mins} phút ${remLabel}s`;
+}
+
+function computeTimelineTotalSeconds(scenes: Scene[]): number {
+  let total = 0;
+  for (const scene of scenes) {
+    const hasVideos = scene.videos && scene.videos.length > 0;
+    let segmentDurations: number[] = [];
+
+    if (scene.selectedVideos && scene.selectedVideos.length > 0) {
+      segmentDurations = scene.selectedVideos.map((seg) => seg.duration ?? 0);
+    } else if (hasVideos) {
+      segmentDurations = [scene.srtContext?.duration ?? 10];
+    }
+
+    if (segmentDurations.length > 0) {
+      total += segmentDurations.reduce((sum, d) => sum + d, 0);
+    } else if (scene.srtContext?.duration) {
+      total += scene.srtContext.duration;
+    }
+  }
+  return total;
 }
 
 function parseSRT(srt: string) {
@@ -253,6 +306,10 @@ function TimelinePreview({
   const validScenes = scenes.filter((s) => s.videos && s.videos.length > 0);
   const totalPlayable = validScenes.length;
   const isReady = !scenes.some((s) => s.loadingVideos);
+  const totalTimelineSec = React.useMemo(
+    () => computeTimelineTotalSeconds(scenes),
+    [scenes],
+  );
 
   const currentPlayableScene = validScenes[currentSceneIdx];
   const currentSegment =
@@ -470,7 +527,11 @@ function TimelinePreview({
       <div className="h-32 md:h-44 border-t border-white/10 bg-black/60 backdrop-blur-2xl p-3 md:p-4 flex-shrink-0">
         <div className="flex justify-between items-center mb-2">
           <h3 className="text-[9px] md:text-[10px] font-bold uppercase tracking-widest text-slate-500">
-            Timeline Editor {isReady ? "" : "(Loading...)"}
+            Timeline Editor
+            {totalTimelineSec > 0
+              ? `: ${formatTimelineDurationVi(totalTimelineSec)}`
+              : ""}
+            {!isReady ? " (Loading...)" : ""}
           </h3>
           <div className="flex items-center gap-2 md:gap-4">
             <span className="hidden sm:inline text-[9px] md:text-[10px] uppercase font-bold text-slate-400">
@@ -806,6 +867,10 @@ export default function App() {
   const [mergeJobId, setMergeJobId] = useState<string | null>(null);
 
   useEffect(() => {
+    setMergeJobId(null);
+  }, [selectedProjectId]);
+
+  useEffect(() => {
     let cancelled = false;
     const loadConfig = async () => {
       try {
@@ -934,10 +999,15 @@ export default function App() {
 
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
-  const [isExporting, setIsExporting] = useState(false);
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
   const [uploadedAudioFile, setUploadedAudioFile] = useState<File | null>(null);
   const [scenes, setScenes] = useState<Scene[]>([]);
+  const [sceneMergeSelection, setSceneMergeSelection] = useState<number[]>(
+    [],
+  );
+  const [regeneratingKeywordsIdx, setRegeneratingKeywordsIdx] = useState<
+    number | null
+  >(null);
   const [error, setError] = useState<string | null>(null);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<"script" | "preview">("script");
@@ -1123,9 +1193,11 @@ export default function App() {
   };
 
   const applyProjectStudioSetup = () => {
+    const normalizedPacing = normalizePacingProfile(studioDraftPacing);
     setVisualKeywordDirection(studioDraftVisual);
-    setPacingProfile(studioDraftPacing);
-    persistProjectStudioFields(studioDraftVisual, studioDraftPacing);
+    setPacingProfile(normalizedPacing);
+    setStudioDraftPacing(normalizedPacing);
+    persistProjectStudioFields(studioDraftVisual, normalizedPacing);
     setIsProjectStudioSetupOpen(false);
     setIsDirty(true);
     toast.success("Đã lưu thiết lập cho dự án.");
@@ -1182,7 +1254,9 @@ export default function App() {
       try {
         if (proj.pacingProfileJson) {
           const parsed = JSON.parse(proj.pacingProfileJson);
-          setPacingProfile({ ...DEFAULT_PACING_PROFILE, ...parsed });
+          setPacingProfile(
+            normalizePacingProfile({ ...DEFAULT_PACING_PROFILE, ...parsed }),
+          );
         } else {
           setPacingProfile({ ...DEFAULT_PACING_PROFILE });
         }
@@ -1196,9 +1270,11 @@ export default function App() {
         setAudioUrl(null);
       }
       setDownloadUrl(proj.downloadUrl || null);
+      setSceneMergeSelection([]);
     } else {
       setScript("");
       setScenes([]);
+      setSceneMergeSelection([]);
       setVisualKeywordDirection("");
       setPacingProfile({ ...DEFAULT_PACING_PROFILE });
       setAudioUrl(null);
@@ -1365,9 +1441,153 @@ export default function App() {
     setIsDirty(true);
 
     await fetchSceneVideos(newKeyword, sceneIdx, sceneText, sceneDuration, {
-      avoidTerms: scenes[sceneIdx]?.srtContext?.avoidTerms,
       choicesLimit: pacingProfile.storyblocksChoicesPerKeyword,
     });
+  };
+
+  const toggleSceneMergeSelection = (idx: number) => {
+    setSceneMergeSelection((prev) =>
+      prev.includes(idx) ? prev.filter((i) => i !== idx) : [...prev, idx],
+    );
+  };
+
+  const handleMergeSelectedScenes = () => {
+    if (sceneMergeSelection.length < 2) {
+      toast.error("Chọn ít nhất 2 phân cảnh để gộp.");
+      return;
+    }
+    const merged = mergeEditorScenesAtIndices(scenes, sceneMergeSelection);
+    setScenes(merged);
+    setSceneMergeSelection([]);
+    setIsDirty(true);
+    toast.success(
+      `Đã gộp ${sceneMergeSelection.length} phân cảnh. Bấm «Render lại keywords EN» để đề xuất từ khóa mới.`,
+    );
+  };
+
+  const handleRegenerateKeywordsEN = async (sceneIdx: number) => {
+    const scene = scenes[sceneIdx];
+    if (!scene?.text?.trim()) return;
+
+    if (!ai) {
+      toast.error(
+        "Cần Gemini API Key (Settings) để đề xuất keywords EN.",
+      );
+      setIsSettingsOpen(true);
+      return;
+    }
+
+    setRegeneratingKeywordsIdx(sceneIdx);
+    const toastId = `regen-kw-${sceneIdx}`;
+    toast.loading("Gemini — đề xuất keywords EN cho phân cảnh đã gộp...", {
+      id: toastId,
+    });
+
+    try {
+      const draft = visualDraftFromEditorScene(scene, 0);
+      const langHint = detectSubtitleLangHint([{ text: scene.text }]);
+
+      const kwPrompt = buildSceneKeywordsPrompt(
+        [draft],
+        visualKeywordDirection,
+        langHint,
+      );
+      const viPrompt = buildVietnameseSceneNotesPrompt([draft]);
+
+      const [kwRes, viRes] = await Promise.all([
+        ai.models.generateContent({
+          model: config.analysisModel,
+          contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
+          config: buildGeminiJsonConfig("scene_keywords"),
+        }),
+        ai.models.generateContent({
+          model: config.analysisModel,
+          contents: [{ role: "user", parts: [{ text: viPrompt }] }],
+          config: buildGeminiJsonConfig("scene_summaries_vi"),
+        }),
+      ]);
+
+      if (kwRes.usageMetadata) {
+        setTokenUsageByStage((prev) => ({
+          ...prev,
+          scene_keywords: parseUsageMetadata(kwRes.usageMetadata),
+        }));
+      }
+
+      let plans;
+      try {
+        const kwParsed = robustJsonParse(kwRes.text || "{}");
+        plans = parseKeywordPlans(kwParsed, 1, [draft]);
+      } catch {
+        plans = parseKeywordPlans({}, 1, [draft]);
+      }
+      if (plansLookGeneric(plans)) {
+        plans = mergeKeywordPlansWithDrafts(plans, [draft]);
+      }
+
+      let summaryVi = scene.srtContext?.summaryVi || "";
+      try {
+        const viParsed = robustJsonParse(viRes.text || "{}");
+        const notes = parseVietnameseSceneNotes(viParsed, 1, [draft]);
+        summaryVi = notes[0] || summaryVi;
+      } catch {
+        /* giữ ghi chú cũ */
+      }
+
+      const plan = plans[0];
+      const primary = primaryKeywordFromPlan(plan);
+
+      setScenes((prev) => {
+        const copy = [...prev];
+        copy[sceneIdx] = {
+          ...copy[sceneIdx],
+          keyword: primary,
+          videos: [],
+          selectedVideoIdx: 0,
+          selectedVideos: [],
+          loadingVideos: true,
+          srtContext: {
+            ...copy[sceneIdx].srtContext,
+            startTime:
+              copy[sceneIdx].srtContext?.startTime || "00:00:00,000",
+            endTime: copy[sceneIdx].srtContext?.endTime || "00:00:00,000",
+            duration: copy[sceneIdx].srtContext?.duration ?? draft.durationSec,
+            keywords: plan.keywords,
+            fallbackKeywords: plan.fallback_keywords,
+            storyblocksSearchQueries: plan.storyblocks_search_queries,
+            summaryVi,
+            pacingZone:
+              copy[sceneIdx].srtContext?.pacingZone || draft.pacingZone,
+          },
+        };
+        return copy;
+      });
+      setIsDirty(true);
+
+      toast.dismiss(toastId);
+      toast.success(`Keywords EN: «${primary}» — đang tìm Storyblocks...`);
+
+      await fetchSceneVideos(
+        primary,
+        sceneIdx,
+        scene.text,
+        scene.srtContext?.duration ?? draft.durationSec,
+        { choicesLimit: pacingProfile.storyblocksChoicesPerKeyword },
+      );
+    } catch (err: any) {
+      console.error("Regenerate keywords:", err);
+      toast.dismiss(toastId);
+      toast.error(formatAIError(err));
+      setScenes((prev) => {
+        const copy = [...prev];
+        if (copy[sceneIdx]) {
+          copy[sceneIdx] = { ...copy[sceneIdx], loadingVideos: false };
+        }
+        return copy;
+      });
+    } finally {
+      setRegeneratingKeywordsIdx(null);
+    }
   };
 
   const handleProcessScript = async () => {
@@ -1405,6 +1625,7 @@ export default function App() {
           end_sec: b.endTime,
         }));
         const subBlocks = blocksToSubtitleBlocks(blocks);
+        const langHint = detectSubtitleLangHint(linePayload);
 
         toast.loading("Gemini — Meaning beats (lớp nội dung)...", {
           id: "analyze-srt",
@@ -1413,6 +1634,7 @@ export default function App() {
         const beatsPrompt = buildMeaningBeatsPrompt(
           linePayload,
           visualKeywordDirection,
+          langHint,
         );
         const beatsRes = await ai.models.generateContent({
           model: config.analysisModel,
@@ -1441,6 +1663,16 @@ export default function App() {
           );
         }
 
+        if (meaningBeats.length === 0) {
+          meaningBeats = ruleBasedMeaningBeats(subBlocks, 4);
+          toast(
+            langHint === "de"
+              ? "SRT tiếng Đức — gom phân cảnh theo luật (Gemini beats trống)."
+              : "Gom phân cảnh theo luật (Gemini beats trống).",
+            { id: "analyze-srt", icon: "ℹ️" },
+          );
+        }
+
         toast.loading("Rule engine — gom phân cảnh & pacing...", {
           id: "analyze-srt",
         });
@@ -1454,19 +1686,30 @@ export default function App() {
         if (drafts.length === 0)
           throw new Error("Không thể tạo visual scene từ SRT.");
 
-        toast.loading("Gemini — Keywords & Storyblocks queries (English)...", {
-          id: "analyze-srt",
-        });
+        toast.loading(
+          "Gemini — Keywords EN + ghi chú tiếng Việt (song song)...",
+          { id: "analyze-srt" },
+        );
 
         const kwPrompt = buildSceneKeywordsPrompt(
           drafts,
           visualKeywordDirection,
+          langHint,
         );
-        const kwRes = await ai.models.generateContent({
-          model: config.analysisModel,
-          contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
-          config: buildGeminiJsonConfig("scene_keywords"),
-        });
+        const viPrompt = buildVietnameseSceneNotesPrompt(drafts);
+
+        const [kwRes, viRes] = await Promise.all([
+          ai.models.generateContent({
+            model: config.analysisModel,
+            contents: [{ role: "user", parts: [{ text: kwPrompt }] }],
+            config: buildGeminiJsonConfig("scene_keywords"),
+          }),
+          ai.models.generateContent({
+            model: config.analysisModel,
+            contents: [{ role: "user", parts: [{ text: viPrompt }] }],
+            config: buildGeminiJsonConfig("scene_summaries_vi"),
+          }),
+        ]);
 
         if (kwRes.usageMetadata) {
           setTokenUsageByStage((prev) => ({
@@ -1474,14 +1717,46 @@ export default function App() {
             scene_keywords: parseUsageMetadata(kwRes.usageMetadata),
           }));
         }
+        if (viRes.usageMetadata) {
+          setTokenUsageByStage((prev) => ({
+            ...prev,
+            scene_summaries_vi: parseUsageMetadata(viRes.usageMetadata),
+          }));
+        }
+
+        let vietnameseNotes: string[] = [];
+        try {
+          const viParsed = robustJsonParse(viRes.text || "{}");
+          vietnameseNotes = parseVietnameseSceneNotes(
+            viParsed,
+            drafts.length,
+            drafts,
+          );
+        } catch (e) {
+          console.error("Vietnamese scene notes parse error:", e);
+          vietnameseNotes = parseVietnameseSceneNotes({}, drafts.length, drafts);
+        }
 
         let plans;
         try {
           const kwParsed = robustJsonParse(kwRes.text || "{}");
-          plans = parseKeywordPlans(kwParsed, drafts.length);
+          plans = parseKeywordPlans(kwParsed, drafts.length, drafts);
         } catch (e) {
           console.error("Keyword plan parse error:", e);
-          plans = parseKeywordPlans({}, drafts.length);
+          plans = parseKeywordPlans({}, drafts.length, drafts);
+        }
+
+        if (plansLookGeneric(plans)) {
+          console.warn(
+            "[SRT] Keyword plans generic — merging with draft topics/hints",
+          );
+          plans = mergeKeywordPlansWithDrafts(plans, drafts);
+          toast(
+            langHint === "de"
+              ? "Đã bổ sung từ khóa EN từ nội dung từng phân cảnh (tránh 'B-roll Footage' chung)."
+              : "Đã bổ sung từ khóa EN theo từng phân cảnh.",
+            { duration: 4000 },
+          );
         }
 
         initialScenes = drafts.map((d, i) => {
@@ -1504,27 +1779,26 @@ export default function App() {
               duration: d.durationSec,
               keywords: plan.keywords,
               fallbackKeywords: plan.fallback_keywords,
-              avoidTerms: plan.avoid_terms,
               storyblocksSearchQueries: plan.storyblocks_search_queries,
-              summaryVi:
-                plan.summary_vi_note ||
-                d.summaryVi ||
-                d.text.slice(0, 160),
+              summaryVi: vietnameseNotes[i] || d.summaryVi || d.text.slice(0, 160),
               pacingZone: d.pacingZone,
             },
           };
         });
 
-        const originalFullText = blocks.map((b) => b.text).join(" ");
-        const reconstructedFullText = initialScenes.map((s) => s.text).join(" ");
-        if (originalFullText !== reconstructedFullText) {
+        const integrity = validateSrtSceneTextIntegrity(subBlocks, drafts);
+        if (!integrity.ok) {
           console.error(
-            "Text mismatch!",
-            originalFullText.length,
-            reconstructedFullText.length,
+            "[SRT] Text integrity failed",
+            integrity.missingLineCount > 0
+              ? `missing ${integrity.missingLineCount} subtitle lines`
+              : "normalized text mismatch",
+            { sceneCount: drafts.length },
           );
           throw new Error(
-            "Lỗi hệ thống: Phân cảnh thiếu nội dung so với SRT gốc. Hãy thử lại hoặc chia nhỏ file.",
+            integrity.missingLineCount > 0
+              ? `Lỗi hệ thống: ${integrity.missingLineCount} dòng SRT không nằm trong phân cảnh. Hãy thử lại hoặc chia nhỏ file.`
+              : "Lỗi hệ thống: Nội dung phân cảnh không khớp SRT gốc (khoảng trắng/unicode). Hãy thử phân tích lại.",
           );
         }
 
@@ -1661,7 +1935,6 @@ Văn bản: ${script}`;
             scene.text,
             scene.srtContext?.duration,
             {
-              avoidTerms: scene.srtContext?.avoidTerms,
               choicesLimit: pacingProfile.storyblocksChoicesPerKeyword,
             },
           );
@@ -1687,7 +1960,7 @@ Văn bản: ${script}`;
     index: number,
     sceneText: string,
     sceneDuration?: number,
-    fetchOpts?: { avoidTerms?: string[]; choicesLimit?: number },
+    fetchOpts?: { choicesLimit?: number },
   ) => {
     try {
       const normalizedKeyword = keyword.trim().toLowerCase();
@@ -1734,18 +2007,12 @@ Văn bản: ${script}`;
       }
 
       const reqDuration = sceneDuration || 10;
-      const avoid = fetchOpts?.avoidTerms ?? [];
       const limit =
         fetchOpts?.choicesLimit ??
         pacingProfile.storyblocksChoicesPerKeyword;
 
-      const ranked = rankStockVideos(allVideos, reqDuration, avoid);
-      let displayVideos = ranked.filtered.slice(0, limit);
-
-      if (displayVideos.length === 0 && avoid.length > 0) {
-        const fallbackRank = rankStockVideos(allVideos, reqDuration, []);
-        displayVideos = fallbackRank.filtered.slice(0, limit);
-      }
+      const ranked = rankStockVideos(allVideos, reqDuration);
+      const displayVideos = ranked.filtered.slice(0, limit);
 
       let bestIdx = 0;
       let selectedSegments: SelectedVideo[] = [];
@@ -1813,108 +2080,6 @@ Văn bản: ${script}`;
       return updated;
     });
     setIsDirty(true);
-  };
-
-  const handleExportExcel = () => {
-    if (scenes.length === 0) return;
-
-    const data: any[] = [];
-    scenes.forEach((scene) => {
-      if (!scene.videos || scene.videos.length === 0) {
-        data.push({
-          "Scene ID": scene.id,
-          "Keyword (Storyblocks)": scene.keyword,
-          "Original Text": scene.text,
-          Option: "N/A",
-          "Video Title": "N/A",
-          "Direct Video URL": "N/A",
-          "Stock Page URL": "N/A",
-          Selected: "No",
-        });
-      } else {
-        scene.videos.forEach((video, vIdx) => {
-          data.push({
-            "Scene ID": scene.id,
-            "Keyword (Storyblocks)": scene.keyword,
-            "Original Text": scene.text,
-            Option: `#${vIdx + 1}`,
-            "Video Title": video.title || "N/A",
-            "Direct Video URL": video.url || "N/A",
-            "Stock Page URL": video.stockUrl || "N/A",
-            Selected: scene.selectedVideoIdx === vIdx ? "Yes" : "No",
-          });
-        });
-      }
-    });
-
-    const worksheet = XLSX.utils.json_to_sheet(data);
-    const workbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(workbook, worksheet, "Scenes");
-
-    // Fix column widths
-    const max_width = data.reduce(
-      (w, r) => Math.max(w, r["Original Text"].length),
-      20,
-    );
-    worksheet["!cols"] = [
-      { wch: 10 }, // Scene ID
-      { wch: 20 }, // Keyword
-      { wch: Math.min(max_width, 50) }, // Original Text
-      { wch: 10 }, // Option
-      { wch: 30 }, // Video Title
-      { wch: 50 }, // Direct URL
-      { wch: 50 }, // Stock URL
-      { wch: 10 }, // Selected
-    ];
-
-    XLSX.writeFile(
-      workbook,
-      `${APP_NAME}_Ver${APP_VERSION}_Export_${new Date().toISOString().split("T")[0]}.xlsx`,
-    );
-  };
-
-  const handleDownloadLinks = () => {
-    if (scenes.length === 0) return;
-
-    const links: string[] = [];
-    scenes.forEach((scene) => {
-      if (scene.videos && scene.videos.length > 0) {
-        const segments =
-          scene.selectedVideos && scene.selectedVideos.length > 0
-            ? scene.selectedVideos
-            : [
-                {
-                  videoIdx: scene.selectedVideoIdx,
-                  duration: scene.srtContext?.duration || 10,
-                  startTimeOffset: 0,
-                },
-              ];
-
-        segments.forEach((seg) => {
-          const video = scene.videos[seg.videoIdx] || scene.videos[0];
-          if (video && video.stockUrl && video.stockUrl !== "N/A") {
-            links.push(video.stockUrl);
-          }
-        });
-      }
-    });
-
-    if (links.length === 0) {
-      toast.error("Không có link nào được chọn");
-      return;
-    }
-
-    const uniqueLinks = Array.from(new Set(links));
-    const content = uniqueLinks.join("\n");
-    const blob = new Blob([content], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "stock_urls.txt";
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   };
 
   const handleConnectDrive = async () => {
@@ -2024,128 +2189,22 @@ Văn bản: ${script}`;
           if (data.mergeJobId) {
              toast.success("Merge job initiated!" + (uploadedAudioFile ? " (kèm nhạc nền)" : ""));
              setMergeJobId(data.mergeJobId);
+             try {
+               const updated = await updateProjectApi(projectId, {
+                 status: "editing",
+               });
+               setProjects((prev) =>
+                 prev.map((p) => (p.id === projectId ? updated : p)),
+               );
+             } catch {
+               /* không chặn merge */
+             }
           } else {
              toast.error(data.error || "Failed to start merge job");
           }
       } catch (error) {
           toast.error("Failed to start merge job");
       }
-  };
-
-  const handleExportVideo = async (isFinal: boolean = false, customScenes?: any[]) => {
-    const targetScenes = customScenes || scenes;
-    if (targetScenes.length === 0) return;
-    
-    if (isFinal && !config.storyblocksCookies) {
-      toast.error("Vui lòng nhập Storyblocks Cookies trong phần Settings trước khi tải bản đẹp.");
-      setIsSettingsOpen(true);
-      return;
-    }
-
-    const isSingle = targetScenes.length === 1;
-
-    setIsExporting(true);
-    setDownloadUrl(null);
-    toast.loading(
-      isFinal 
-        ? (isSingle ? "Đang tải bản đẹp & xử lý Scene..." : "Đang tải bản đẹp & biên tập (Final)...")
-        : (isSingle ? "Đang render nháp Scene..." : "Đang tải & biên tập video (Draft/FFmpeg)..."), 
-      {
-        id: "export-video",
-      }
-    );
-
-    try {
-      const formData = new FormData();
-      formData.append("scenes", JSON.stringify(targetScenes));
-      formData.append("isFinal", String(isFinal));
-      if (isFinal) {
-        formData.append("cookies", config.storyblocksCookies);
-        if (config.driveAccessToken) {
-          formData.append("driveToken", config.driveAccessToken);
-        }
-      }
-      
-      if (selectedProjectId) {
-        formData.append("parentId", selectedProjectId);
-      }
-      
-      // Chỉ gửi audio nếu là export toàn bộ project
-      if (!customScenes && uploadedAudioFile) {
-        formData.append("audio", uploadedAudioFile);
-      }
-
-      const res = await fetch("/api/edit-video", {
-        method: "POST",
-        body: formData,
-      });
-
-      const data = await handleApiResponse(res, "edit-video");
-      if (data.projectId) {
-        // Bắt đầu background polling
-        const poll = async () => {
-          try {
-            const sRes = await fetch(
-              `/api/edit-video-status/${data.projectId}`
-            );
-            const sData = await handleApiResponse(sRes, "edit-video-status");
-
-            if (sData.status === "done") {
-              toast.dismiss("export-video");
-              toast.success("Video đã sẵn sàng!");
-              setIsExporting(false);
-              setDownloadUrl(sData.downloadUrl);
-              setIsDirty(true);
-
-              // Fix for iframe download: Try window.open first, it's more reliable in some iframes
-              try {
-                window.open(sData.downloadUrl, "_blank");
-              } catch (e) {
-                console.error("Popup blocked or failed:", e);
-              }
-
-              // Auto download fallback
-              try {
-                const a = document.createElement("a");
-                a.href = sData.downloadUrl;
-                a.target = "_blank";
-                a.download =
-                  sData.downloadUrl.split("/").pop() || "final_video.mp4";
-                document.body.appendChild(a);
-                a.click();
-                document.body.removeChild(a);
-              } catch (e) {
-                console.error("Download fallback failed:", e);
-              }
-            } else if (sData.status === "error") {
-              throw new Error(sData.error || "Lỗi xử lý video");
-            } else {
-              // Đang processing
-              setTimeout(poll, 3000);
-            }
-          } catch (err: any) {
-            console.error("Polling error: ", err);
-            toast.dismiss("export-video");
-            toast.error("Xuất video thất bại: " + err.message);
-            setIsExporting(false);
-          }
-        };
-
-        poll();
-        return; // Dừng logic chính, chuyển sang poll
-      } else {
-        throw new Error(data.error || "Lỗi tạo dự án video");
-      }
-    } catch (err: any) {
-      console.error("Export Video Error:", err);
-      const msg =
-        err.message === "Failed to fetch"
-          ? "Kết nối server thất bại (Failed to fetch). Hãy thử refresh trang."
-          : err.message;
-      toast.dismiss("export-video");
-      toast.error("Xuất video thất bại: " + msg);
-      setIsExporting(false);
-    }
   };
 
   if (authLoading)
@@ -2338,18 +2397,37 @@ Văn bản: ${script}`;
                   No projects yet.
                 </div>
               ) : (
-                projects.map((proj) => (
+                projects.map((proj) => {
+                  const projStatus = resolveProjectStatus(proj);
+                  const createdLabel = formatProjectCreatedAtVi(proj.createdAt);
+                  const statusIconClass =
+                    projStatus === "completed"
+                      ? "text-emerald-400"
+                      : "text-amber-400";
+                  const statusTitle =
+                    projStatus === "completed"
+                      ? "Hoàn thành"
+                      : "Đang chỉnh sửa";
+                  return (
                   <div
                     key={proj.id}
                     onClick={() => setSelectedProjectId(proj.id)}
-                    className={`group flex items-center justify-between p-2 rounded cursor-pointer transition-colors ${selectedProjectId === proj.id ? "bg-indigo-500/20 text-indigo-300" : "text-slate-400 hover:bg-white/5"}`}
+                    title={statusTitle}
+                    className={`group flex items-center justify-between gap-1 px-2 py-1.5 rounded cursor-pointer transition-colors ${selectedProjectId === proj.id ? "bg-indigo-500/20" : "hover:bg-white/5"}`}
                   >
-                    <div className="flex items-center gap-2 overflow-hidden flex-1">
+                    <div className="flex items-center gap-2 overflow-hidden flex-1 min-w-0">
                       {selectedProjectId === proj.id ? (
-                        <FolderOpen size={14} className="flex-shrink-0" />
+                        <FolderOpen
+                          size={14}
+                          className={`flex-shrink-0 ${statusIconClass}`}
+                        />
                       ) : (
-                        <Folder size={14} className="flex-shrink-0" />
+                        <Folder
+                          size={14}
+                          className={`flex-shrink-0 ${statusIconClass}`}
+                        />
                       )}
+                      <div className="min-w-0 flex-1 leading-tight">
                       {editingProjectId === proj.id ? (
                         <input
                           autoFocus
@@ -2365,10 +2443,24 @@ Văn bản: ${script}`;
                           onClick={(e) => e.stopPropagation()}
                         />
                       ) : (
-                        <span className="text-xs truncate">{proj.title}</span>
+                        <>
+                          <span
+                            className={`text-xs truncate block font-medium ${selectedProjectId === proj.id ? "text-indigo-200" : "text-slate-300"}`}
+                          >
+                            {proj.title}
+                          </span>
+                          {createdLabel ? (
+                            <span
+                              className={`text-[9px] truncate block ${selectedProjectId === proj.id ? "text-indigo-300/60" : "text-slate-500"}`}
+                            >
+                              {createdLabel}
+                            </span>
+                          ) : null}
+                        </>
                       )}
+                      </div>
                     </div>
-                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all">
+                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-all shrink-0">
                       <button
                         onClick={(e) => startEditingProject(proj, e)}
                         className="text-slate-500 hover:text-indigo-400 p-1.5 cursor-pointer"
@@ -2385,7 +2477,8 @@ Văn bản: ${script}`;
                       </button>
                     </div>
                   </div>
-                ))
+                  );
+                })
               )}
             </div>
           </aside>
@@ -2678,6 +2771,25 @@ Văn bản: ${script}`;
             <div className="flex flex-wrap items-center gap-1.5 md:gap-2">
               {scenes.length > 0 && (
                 <>
+                  {sceneMergeSelection.length >= 2 && (
+                    <button
+                      type="button"
+                      onClick={handleMergeSelectedScenes}
+                      className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-violet-600/20 text-violet-300 hover:bg-violet-600/35 border border-violet-500/40 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-colors uppercase tracking-wider"
+                    >
+                      <GitMerge size={10} className="md:w-3 md:h-3" />
+                      Gộp {sceneMergeSelection.length} phân cảnh
+                    </button>
+                  )}
+                  {sceneMergeSelection.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setSceneMergeSelection([])}
+                      className="px-2 py-1 text-[9px] text-slate-400 hover:text-white border border-white/10 rounded uppercase tracking-wider"
+                    >
+                      Bỏ chọn
+                    </button>
+                  )}
                   <button
                     onClick={() => saveProjectState(script, scenes, true)}
                     disabled={isSaving}
@@ -2700,100 +2812,7 @@ Văn bản: ${script}`;
                       <span className="absolute -top-1 -right-1 w-2 h-2 bg-amber-500 rounded-full animate-pulse shadow-[0_0_8px_rgba(245,158,11,0.8)]" />
                     )}
                   </button>
-                  <button
-                    onClick={() => handleExportVideo(false)}
-                    disabled={
-                      isExporting || scenes.some((s) => s.loadingVideos)
-                    }
-                    className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-red-600/20 text-red-400 hover:bg-red-600/40 border border-red-500/30 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-colors uppercase tracking-wider disabled:opacity-50"
-                  >
-                    {isExporting ? (
-                      <Loader2 size={10} className="animate-spin" />
-                    ) : (
-                      <MonitorPlay size={10} className="md:w-3 md:h-3" />
-                    )}
-                    <span className="hidden sm:inline">
-                      Export Draft
-                    </span>
-                    {!isExporting && <span className="sm:hidden">Draft</span>}
-                  </button>
 
-                  <button
-                    onClick={() => handleExportVideo(true)}
-                    disabled={
-                      isExporting || scenes.some((s) => s.loadingVideos)
-                    }
-                    className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-indigo-600/40 text-indigo-300 hover:bg-indigo-600/60 border border-indigo-400/50 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-all uppercase tracking-wider disabled:opacity-50 shadow-[0_0_15px_rgba(99,102,241,0.2)]"
-                  >
-                    {isExporting ? (
-                      <Loader2 size={10} className="animate-spin" />
-                    ) : (
-                      <MonitorPlay size={10} className="md:w-3 md:h-3 text-indigo-400" />
-                    )}
-                    <span className="hidden sm:inline">
-                      Final Render (HQ)
-                    </span>
-                    {!isExporting && <span className="sm:hidden">Final</span>}
-                  </button>
-
-                  <button
-                    onClick={handleOpenDownloader}
-                    className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-emerald-600/40 text-emerald-300 hover:bg-emerald-600/60 border border-emerald-400/50 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-all uppercase tracking-wider shadow-[0_0_15px_rgba(16,185,129,0.2)]"
-                  >
-                    <DownloadCloud size={10} className="md:w-3 md:h-3 text-emerald-400" />
-                    <span className="hidden sm:inline">Drive Downloader</span>
-                    <span className="sm:hidden">Drive</span>
-                  </button>
-
-                  {downloadUrl && (
-                    <button
-                      onClick={() => window.open(downloadUrl, "_blank")}
-                      className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-blue-600/20 text-blue-400 hover:bg-blue-600/40 border border-blue-500/30 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-colors uppercase tracking-wider shadow-[0_0_10px_rgba(59,130,246,0.3)]"
-                    >
-                      <Download size={10} className="md:w-3 md:h-3" />
-                      <span className="hidden sm:inline">Download MP4</span>
-                    </button>
-                  )}
-                  <button
-                    onClick={() => {
-                        const content = JSON.stringify(
-                            {
-                              script,
-                              scenes,
-                              audioUrl,
-                              visualKeywordDirection,
-                              pacingProfile,
-                            },
-                            null,
-                            2,
-                          );
-                        const blob = new Blob([content], { type: "application/json" });
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement("a");
-                        a.href = url;
-                        a.download = `project_${selectedProjectId || 'export'}.json`;
-                        a.click();
-                        URL.revokeObjectURL(url);
-                    }}
-                    className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-slate-600/20 text-slate-400 hover:bg-slate-600/40 border border-slate-500/30 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-colors uppercase tracking-wider"
-                  >
-                    <Save size={10} className="md:w-3 md:h-3" />
-                    <span className="hidden sm:inline">Export JSON</span>
-                  </button>
-                  <button
-                    onClick={handleExportExcel}
-                    className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-green-600/20 text-green-400 hover:bg-green-600/40 border border-green-500/30 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-colors uppercase tracking-wider"
-                  >
-                    <Download size={10} className="md:w-3 md:h-3" />
-                    <span className="hidden sm:inline">Excel</span>
-                  </button>
-                  <button
-                    onClick={handleDownloadLinks}
-                    className="px-2 py-1 md:px-3 md:py-1 text-[9px] md:text-[10px] bg-slate-600/20 text-slate-400 hover:bg-slate-600/40 border border-slate-500/30 rounded flex items-center gap-1 md:gap-1.5 font-bold transition-colors uppercase tracking-wider"
-                  >
-                    <FileText size={10} className="md:w-3 md:h-3" />
-                    <span className="hidden sm:inline">Links.txt</span>
-                  </button>
                 </>
               )}
               {isProcessing && (
@@ -2826,11 +2845,22 @@ Văn bản: ${script}`;
                     animate={{ opacity: 1, y: 0 }}
                     transition={{ delay: idx * 0.1 }}
                     key={idx}
-                    className={`relative group ${scene.loadingVideos ? "opacity-60 grayscale" : ""}`}
+                    className={`relative group ${scene.loadingVideos ? "opacity-60 grayscale" : ""} ${sceneMergeSelection.includes(idx) ? "ring-2 ring-violet-500/60 rounded-xl" : ""}`}
                   >
                     <div className="absolute -inset-0.5 bg-gradient-to-r from-indigo-500 to-purple-600 rounded-xl blur opacity-0 group-hover:opacity-20 transition duration-500"></div>
+                    <label className="absolute top-2 left-2 z-10 flex items-center gap-1.5 cursor-pointer bg-black/60 backdrop-blur px-2 py-1 rounded-md border border-white/10 hover:border-violet-500/40 transition-colors">
+                      <input
+                        type="checkbox"
+                        checked={sceneMergeSelection.includes(idx)}
+                        onChange={() => toggleSceneMergeSelection(idx)}
+                        className="rounded border-white/20 bg-white/5 text-violet-500 focus:ring-violet-500/30 w-3 h-3"
+                      />
+                      <span className="text-[8px] uppercase font-bold text-slate-400 tracking-wider">
+                        Gộp
+                      </span>
+                    </label>
                     <div
-                      className={`relative ${scene.loadingVideos ? "bg-white/5 border border-white/5" : "bg-[#0e0e11] border border-white/10"} rounded-xl p-3 md:p-4 flex flex-col lg:flex-row gap-4 md:gap-6`}
+                      className={`relative ${scene.loadingVideos ? "bg-white/5 border border-white/5" : "bg-[#0e0e11] border border-white/10"} rounded-xl p-3 md:p-4 pt-8 flex flex-col lg:flex-row gap-4 md:gap-6`}
                     >
                       {/* Video Selection */}
                       <div className="w-full lg:w-64 flex-shrink-0 flex flex-col gap-3">
@@ -2927,6 +2957,14 @@ Văn bản: ${script}`;
                             >
                               Scene {idx + 1 < 10 ? `0${idx + 1}` : idx + 1}
                             </h3>
+                            {scene.isMerged && (
+                              <span className="text-[9px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full border border-violet-500/30 bg-violet-500/10 text-violet-300">
+                                Đã gộp
+                                {scene.mergedFromIds && scene.mergedFromIds.length > 1
+                                  ? ` ×${scene.mergedFromIds.length}`
+                                  : ""}
+                              </span>
+                            )}
                             {scene.srtContext?.pacingZone && (
                               <span className="text-[9px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full border border-white/10 bg-white/5 text-slate-400">
                                 {scene.srtContext.pacingZone}
@@ -2982,26 +3020,26 @@ Văn bản: ${script}`;
                                   >
                                     <Play size={10} fill="currentColor" /> Source
                                   </a>
-                                  <button
-                                    onClick={() =>
-                                      handleExportVideo(false, [scene])
-                                    }
-                                    disabled={isExporting}
-                                    className="text-[9px] bg-indigo-500/10 text-indigo-400 hover:bg-indigo-500/20 border border-indigo-500/20 px-2 py-0.5 rounded flex items-center gap-1 uppercase tracking-wider transition-colors disabled:opacity-50"
-                                  >
-                                    <MonitorPlay size={10} /> Render Single
-                                  </button>
-                                  <button
-                                    onClick={() =>
-                                      handleExportVideo(true, [scene])
-                                    }
-                                    disabled={isExporting}
-                                    className="text-[9px] bg-amber-500/10 text-amber-400 hover:bg-amber-500/20 border border-amber-500/20 px-2 py-0.5 rounded flex items-center gap-1 uppercase tracking-wider transition-colors disabled:opacity-50"
-                                  >
-                                    <Download size={10} /> HQ Single
-                                  </button>
                                 </>
                               )}
+                            {scene.isMerged && (
+                              <button
+                                type="button"
+                                onClick={() => handleRegenerateKeywordsEN(idx)}
+                                disabled={
+                                  scene.loadingVideos ||
+                                  regeneratingKeywordsIdx === idx
+                                }
+                                className="text-[9px] bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500/25 border border-emerald-500/30 px-2 py-0.5 rounded flex items-center gap-1 uppercase tracking-wider transition-colors disabled:opacity-50"
+                              >
+                                {regeneratingKeywordsIdx === idx ? (
+                                  <Loader2 size={10} className="animate-spin" />
+                                ) : (
+                                  <Sparkles size={10} />
+                                )}
+                                Render lại keywords EN
+                              </button>
+                            )}
                           </div>
                         </div>
 
@@ -3010,32 +3048,28 @@ Văn bản: ${script}`;
                         >
                           {scene.text}
                         </p>
-                        {scene.srtContext?.summaryVi && (
+                        {scene.srtContext?.summaryVi ? (
                           <p className="text-[11px] leading-snug text-slate-500 mb-2 border-l border-amber-500/40 pl-2 not-italic">
                             <span className="text-[9px] font-bold uppercase text-amber-600/90 mr-1">
                               Ghi chú màn hình (VI)
                             </span>
                             {scene.srtContext.summaryVi}
                           </p>
-                        )}
+                        ) : null}
 
                         {scene.srtContext &&
                           (() => {
-                            const mergedKw = [
-                              ...(scene.srtContext.keywords || []),
-                              ...(scene.srtContext.fallbackKeywords || []),
-                              ...(scene.srtContext.storyblocksSearchQueries || []),
-                            ].filter(Boolean);
-                            const uniqKw = [
-                              ...new Set(mergedKw.map((k) => k.trim())),
-                            ].filter(Boolean);
-                            if (uniqKw.length === 0) return null;
+                            const displayKw = topStoryblocksKeywordsForScene(
+                              scene.srtContext,
+                              scene.keyword,
+                            );
+                            if (displayKw.length === 0) return null;
                             return (
                               <div className="flex flex-wrap gap-1.5 mt-3 pt-3 border-t border-white/5">
                                 <span className="text-[9px] text-slate-500 uppercase font-bold mr-1 self-center truncate">
                                   Keywords EN (Storyblocks):
                                 </span>
-                                {uniqKw.map((kw: string) => (
+                                {displayKw.map((kw: string) => (
                                   <button
                                     key={kw}
                                     onClick={() => refetchSceneVideos(idx, kw)}
@@ -3054,22 +3088,6 @@ Văn bản: ${script}`;
                               </div>
                             );
                           })()}
-                        {scene.srtContext?.avoidTerms &&
-                          scene.srtContext.avoidTerms.length > 0 && (
-                            <div className="flex flex-wrap gap-1 mt-2 items-start">
-                              <span className="text-[9px] text-rose-400/90 uppercase font-bold shrink-0">
-                                Avoid:
-                              </span>
-                              {scene.srtContext.avoidTerms.map((term) => (
-                                <span
-                                  key={term}
-                                  className="text-[9px] px-1.5 py-0.5 rounded border border-rose-500/30 text-rose-200/80 bg-rose-500/10"
-                                >
-                                  {term}
-                                </span>
-                              ))}
-                            </div>
-                          )}
                       </div>
                     </div>
                   </div>
@@ -3092,6 +3110,7 @@ Văn bản: ${script}`;
     ) : (
       <AutomationDownloader 
         projectId={selectedProjectId!}
+        projectRecord={projects.find((p) => p.id === selectedProjectId) ?? null}
         scenes={scenes}
         config={config}
         onConnectDrive={handleConnectDrive}
@@ -3103,6 +3122,11 @@ Văn bản: ${script}`;
         onMerge={(res: string) => handleAutomationMerge(selectedProjectId!, scenes, res)}
         mergeJobId={mergeJobId}
         onMergeJobClear={() => setMergeJobId(null)}
+        onProjectPatch={(updated) => {
+          setProjects((prev) =>
+            prev.map((p) => (p.id === updated.id ? updated : p)),
+          );
+        }}
       />
     )}
   </main>
@@ -3327,38 +3351,57 @@ Văn bản: ${script}`;
                   </label>
                   <label className="flex flex-col gap-0.5 col-span-2">
                     Tổng clip (~10 phút): min – max
+                    <span className="text-[9px] text-slate-600 font-normal normal-case">
+                      Cho phép {PACING_TOTAL_CLIPS_ABSOLUTE_MIN}–
+                      {PACING_TOTAL_CLIPS_ABSOLUTE_MAX} clip (ước lượng video ~10
+                      phút).
+                    </span>
                     <div className="flex gap-2">
                       <input
                         type="number"
-                        min={20}
-                        max={80}
+                        min={PACING_TOTAL_CLIPS_ABSOLUTE_MIN}
+                        max={PACING_TOTAL_CLIPS_ABSOLUTE_MAX}
                         value={studioDraftPacing.maxTotalClips10MinMin}
                         onChange={(e) =>
-                          setStudioDraftPacing((p) => ({
-                            ...p,
-                            maxTotalClips10MinMin: Math.max(
-                              20,
-                              Number(e.target.value) || p.maxTotalClips10MinMin,
-                            ),
-                          }))
+                          setStudioDraftPacing((p) => {
+                            const raw = Number(e.target.value);
+                            const nextMin = Number.isFinite(raw)
+                              ? raw
+                              : p.maxTotalClips10MinMin;
+                            return {
+                              ...p,
+                              ...clampTotalClipsRange(
+                                nextMin,
+                                p.maxTotalClips10MinMax,
+                              ),
+                            };
+                          })
                         }
                         className="flex-1 bg-black/50 border border-white/10 rounded-lg px-2 py-1.5 text-slate-200 text-[12px]"
+                        aria-label="Tổng clip tối thiểu"
                       />
                       <input
                         type="number"
-                        min={20}
-                        max={100}
+                        min={PACING_TOTAL_CLIPS_ABSOLUTE_MIN}
+                        max={PACING_TOTAL_CLIPS_ABSOLUTE_MAX}
                         value={studioDraftPacing.maxTotalClips10MinMax}
                         onChange={(e) =>
-                          setStudioDraftPacing((p) => ({
-                            ...p,
-                            maxTotalClips10MinMax: Math.max(
-                              p.maxTotalClips10MinMin,
-                              Number(e.target.value) || p.maxTotalClips10MinMax,
-                            ),
-                          }))
+                          setStudioDraftPacing((p) => {
+                            const raw = Number(e.target.value);
+                            const nextMax = Number.isFinite(raw)
+                              ? raw
+                              : p.maxTotalClips10MinMax;
+                            return {
+                              ...p,
+                              ...clampTotalClipsRange(
+                                p.maxTotalClips10MinMin,
+                                nextMax,
+                              ),
+                            };
+                          })
                         }
                         className="flex-1 bg-black/50 border border-white/10 rounded-lg px-2 py-1.5 text-slate-200 text-[12px]"
+                        aria-label="Tổng clip tối đa"
                       />
                     </div>
                   </label>

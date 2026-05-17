@@ -17,6 +17,15 @@ async function parseJson<T>(res: Response): Promise<T> {
   return data as T;
 }
 
+export async function fetchProjectApi(projectId: string): Promise<Project> {
+  const res = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}`,
+    fetchOpts,
+  );
+  const data = await parseJson<{ project: Project }>(res);
+  return data.project;
+}
+
 export async function fetchProjects(): Promise<Project[]> {
   const res = await fetch("/api/projects", fetchOpts);
   const data = await parseJson<{ projects: Project[] }>(res);
@@ -47,6 +56,11 @@ export type ProjectPatch = Partial<
     | "pacingProfileJson"
     | "audioUrl"
     | "downloadUrl"
+    | "mergedVideoUrl"
+    | "mergedAt"
+    | "mergeDriveViewUrl"
+    | "mergeDriveDirectUrl"
+    | "status"
   >
 >;
 
