@@ -33,14 +33,7 @@ import { GoogleGenAI, Type } from "@google/genai";
 import * as XLSX from "xlsx";
 import axios from "axios";
 
-import { auth, db, handleFirestoreError, OperationType } from "./lib/firebase";
-import {
-  onAuthStateChanged,
-  signInWithPopup,
-  GoogleAuthProvider,
-  signOut,
-  User,
-} from "firebase/auth";
+import { db, handleFirestoreError, OperationType } from "./lib/firebase";
 import {
   collection,
   doc,
@@ -93,6 +86,13 @@ import {
   LEGACY_CONFIG_STORAGE_KEY,
   LEGACY_PROJECTS_STORAGE_KEY,
 } from "./lib/projectTypes";
+import {
+  clearAppSession,
+  loadAppSession,
+  loginApp,
+  verifyAppSession,
+} from "./lib/appSession";
+import { AppLoginScreen } from "./components/AppLoginScreen";
 
 /** AI Studio: gemini-2.0-flash trả 404 với key/user mới — dùng 2.5.x làm mặc định. */
 const DEFAULT_GEMINI_MODEL = "gemini-2.5-flash";
@@ -698,15 +698,7 @@ function robustJsonParse(text: string): any {
 }
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(null);
-  const [guestId, setGuestId] = useState<string>(() => {
-    let id = localStorage.getItem("guest-id");
-    if (!id) {
-      id = "guest_" + Math.random().toString(36).substring(2, 11) + Date.now();
-      localStorage.setItem("guest-id", id);
-    }
-    return id;
-  });
+  const [appUsername, setAppUsername] = useState<string | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
   const [projects, setProjects] = useState<Project[]>([]);
@@ -1064,31 +1056,44 @@ export default function App() {
     }
   };
 
-  // Authentication
   useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setAuthLoading(false);
-    });
-    return unsubscribe;
+    let cancelled = false;
+    const restoreSession = async () => {
+      const stored = loadAppSession();
+      if (!stored?.token) {
+        if (!cancelled) {
+          setAppUsername(null);
+          setAuthLoading(false);
+        }
+        return;
+      }
+      const ok = await verifyAppSession(stored.token);
+      if (!cancelled) {
+        if (ok) {
+          setAppUsername(stored.username);
+        } else {
+          clearAppSession();
+          setAppUsername(null);
+        }
+        setAuthLoading(false);
+      }
+    };
+    restoreSession();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
-  const login = async () => {
-    try {
-      await signInWithPopup(auth, new GoogleAuthProvider());
-    } catch (error) {
-      console.error("Login failed", error);
-      toast.error("Login failed");
-    }
+  const handleAppLogin = async (username: string, password: string) => {
+    const session = await loginApp(username, password);
+    setAppUsername(session.username);
   };
 
-  const logout = async () => {
-    try {
-      await signOut(auth);
-      setSelectedProjectId(null);
-    } catch (error) {
-      console.error("Logout failed", error);
-    }
+  const handleAppLogout = () => {
+    clearAppSession();
+    setAppUsername(null);
+    setSelectedProjectId(null);
+    toast.success("Đã đăng xuất");
   };
 
   const openProjectStudioSetup = () => {
@@ -2153,6 +2158,18 @@ Văn bản: ${script}`;
       </div>
     );
 
+  if (!appUsername) {
+    return (
+      <AppLoginScreen
+        onLogin={handleAppLogin}
+        onSuccess={() => {
+          const s = loadAppSession();
+          setAppUsername(s?.username || null);
+        }}
+      />
+    );
+  }
+
   const formatError = (err: string) => {
     if (!err) return "";
     try {
@@ -2251,27 +2268,19 @@ Văn bản: ${script}`;
           >
             <Settings size={16} />
           </button>
-          {(!user || user.isAnonymous) ? (
+          <div className="flex items-center gap-2 md:gap-3">
+            <span className="hidden sm:inline-block text-xs text-slate-400 font-mono">
+              {appUsername}
+            </span>
             <button
-              onClick={login}
-              className="px-4 py-1.5 rounded-lg bg-indigo-600 text-sm font-medium hover:bg-indigo-500 transition-colors whitespace-nowrap"
+              onClick={handleAppLogout}
+              className="px-3 py-1.5 rounded-lg border border-white/10 text-xs font-medium text-slate-300 hover:text-red-400 hover:border-red-500/30 transition-colors flex items-center gap-1.5"
+              title="Đăng xuất"
             >
-              Sign In
+              <LogOut size={14} />
+              <span className="hidden md:inline">Đăng xuất</span>
             </button>
-          ) : (
-            <div className="flex items-center gap-2 md:gap-4">
-              <span className="hidden lg:inline-block text-sm text-slate-400">
-                {user.email}
-              </span>
-              <button
-                onClick={logout}
-                className="p-2 text-slate-500 hover:text-red-400 transition-colors"
-                title="Logout"
-              >
-                <LogOut size={16} />
-              </button>
-            </div>
-          )}
+          </div>
           <a
             href="https://www.storyblocks.com/"
             target="_blank"
@@ -2811,7 +2820,7 @@ Văn bản: ${script}`;
             {scenes.length > 0 && (
               <div className="grid grid-cols-1 gap-6 content-start mb-6">
                 {scenes.map((scene, idx) => (
-                  <motion.div
+                  <div
                     id={`scene-card-${idx}`}
                     initial={{ opacity: 0, y: 10 }}
                     animate={{ opacity: 1, y: 0 }}
@@ -3063,7 +3072,7 @@ Văn bản: ${script}`;
                           )}
                       </div>
                     </div>
-                  </motion.div>
+                  </div>
                 ))}
               </div>
             )}
@@ -3105,7 +3114,7 @@ Văn bản: ${script}`;
           role="presentation"
           onClick={cancelProjectStudioSetup}
         >
-          <motion.div
+          <div
             initial={{ opacity: 0, scale: 0.96 }}
             animate={{ opacity: 1, scale: 1 }}
             className="w-full max-w-lg max-h-[92vh] bg-[#0c0c0f] border border-violet-500/20 rounded-2xl shadow-2xl shadow-violet-950/40 flex flex-col"
@@ -3407,14 +3416,14 @@ Văn bản: ${script}`;
                 Lưu cho dự án
               </button>
             </div>
-          </motion.div>
+          </div>
         </div>
       )}
 
       {/* Settings Modal */}
       {isSettingsOpen && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-md z-[100] flex items-center justify-center p-4">
-          <motion.div
+          <div
             initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
             className="w-full max-w-2xl bg-[#0e0e11] border border-white/10 rounded-2xl overflow-hidden shadow-2xl"
@@ -3728,7 +3737,7 @@ Văn bản: ${script}`;
                 Apply Configuration
               </button>
             </div>
-          </motion.div>
+          </div>
         </div>
       )}
     </div>

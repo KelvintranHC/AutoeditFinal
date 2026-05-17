@@ -599,9 +599,11 @@ function getBrowserExecutablePath() {
 }
 
 import { registerProjectRoutes } from "./lib/projectRoutes.js";
+import { registerAppAuthRoutes } from "./lib/appAuthRoutes.js";
 
 const app = express();
 app.use(express.json({ limit: "50mb" }));
+registerAppAuthRoutes(app);
 registerProjectRoutes(app);
 
 const activeJobs = new Map<
