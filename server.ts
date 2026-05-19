@@ -513,34 +513,96 @@ async function uploadToGoogleDrive(
   }
 }
 
-async function downloadFromGoogleDrive(
+/**
+ * Tải nội dung file Drive (alt=media). Bắt buộc supportsAllDrives — thiếu flag này
+ * file trong Shared Drive thường trả 404 dù link xem trên web vẫn mở được.
+ */
+async function streamGoogleDriveFileToPath(
   fileId: string,
-  accessToken: string | null | undefined,
-  destPath: string
-) {
-  const auth = resolveDriveAuth(accessToken);
+  auth: InstanceType<typeof google.auth.OAuth2>,
+  destPath: string,
+): Promise<void> {
   const drive = google.drive({ version: "v3", auth });
-
   const dest = fs.createWriteStream(destPath);
-  console.log(`[Drive] Downloading file ${fileId} to ${destPath}`);
+  console.log(`[Drive] Downloading file ${fileId.slice(0, 16)}… → ${destPath}`);
 
   const response = await drive.files.get(
-    { fileId, alt: "media" },
-    { responseType: "stream" }
+    { fileId, alt: "media", supportsAllDrives: true },
+    { responseType: "stream" },
   );
 
-  return new Promise<string>((resolve, reject) => {
+  await new Promise<void>((resolve, reject) => {
     response.data
-      .on("end", () => {
-        console.log(`[Drive] Download complete: ${destPath}`);
-        resolve(destPath);
-      })
-      .on("error", (err: any) => {
-        console.error(`[Drive] Download error:`, err);
+      .on("end", () => resolve())
+      .on("error", (err: unknown) => {
+        console.error(`[Drive] Download stream error:`, err);
         reject(err);
       })
       .pipe(dest);
   });
+}
+
+/**
+ * Ưu tiên OAuth server (nếu có); nếu 404/403 thì thử lại bằng access token từ app
+ * (trường hợp file thuộc tài khoản/ngữ cảnh mà token client truy cập được).
+ */
+async function downloadFromGoogleDrive(
+  fileId: string,
+  accessToken: string | null | undefined,
+  destPath: string,
+): Promise<string> {
+  const id = normalizeGoogleDriveFileId(fileId);
+  if (!id) {
+    throw new Error(
+      `Drive file id không hợp lệ: ${String(fileId).slice(0, 48)}`,
+    );
+  }
+
+  type Strategy = { auth: InstanceType<typeof google.auth.OAuth2>; label: string };
+  const strategies: Strategy[] = [];
+  if (hasDriveConnection()) {
+    strategies.push({ auth: getDriveAuthClient(), label: "server-oauth" });
+  }
+  const clientTok = typeof accessToken === "string" ? accessToken.trim() : "";
+  if (clientTok) {
+    const oauth = new google.auth.OAuth2();
+    oauth.setCredentials({ access_token: clientTok });
+    strategies.push({ auth: oauth, label: "client-token" });
+  }
+
+  if (strategies.length === 0) {
+    throw new Error(
+      "Google Drive chưa được kết nối (server) và không có driveToken — không thể tải file.",
+    );
+  }
+
+  let lastErr: unknown;
+  for (let i = 0; i < strategies.length; i++) {
+    const { auth, label } = strategies[i];
+    try {
+      if (i > 0 && fs.existsSync(destPath)) {
+        try {
+          fs.unlinkSync(destPath);
+        } catch {
+          /* ignore */
+        }
+      }
+      await streamGoogleDriveFileToPath(id, auth, destPath);
+      console.log(`[Drive] Download complete (${label}): ${destPath}`);
+      return destPath;
+    } catch (e) {
+      lastErr = e;
+      const hasNext = i < strategies.length - 1;
+      if (hasNext && isDriveDownloadAuthRetryable(e)) {
+        console.warn(
+          `[Drive] ${label} không tải được id=${id.slice(0, 12)}… — thử cách xác thực khác`,
+        );
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
 }
 
 puppeteer.use(StealthPlugin());
@@ -678,6 +740,37 @@ function extractGoogleDriveFileId(input: string | undefined | null): string | nu
   const idq = s.match(/[?&]id=([a-zA-Z0-9_-]+)/);
   if (idq) return idq[1];
   return null;
+}
+
+/** Chuẩn hoá id (copy-paste thừa dấu chấm / ngoặc) rồi suy ra id từ URL nếu cần. */
+function normalizeGoogleDriveFileId(raw: string | undefined | null): string {
+  if (raw == null || typeof raw !== "string") return "";
+  let s = raw.trim().replace(/^['"]+|['"]+$/g, "");
+  s = s.replace(/[.\u3000\s]+$/g, "");
+  if (!s) return "";
+  const extracted = extractGoogleDriveFileId(s);
+  return extracted || s;
+}
+
+function isDriveDownloadAuthRetryable(e: unknown): boolean {
+  const err = e as {
+    code?: number | string;
+    status?: number;
+    response?: { status?: number };
+    errors?: Array<{ message?: string }>;
+    message?: string;
+  };
+  const status =
+    err?.response?.status ??
+    (typeof err?.status === "number" ? err.status : undefined);
+  if (status === 404 || status === 403) return true;
+  const code = err?.code;
+  if (code === 404 || code === 403) return true;
+  if (String(code) === "404" || String(code) === "403") return true;
+  const apiMsg = err?.errors?.[0]?.message;
+  if (apiMsg && /not found|403|404/i.test(apiMsg)) return true;
+  const msg = String(err?.message || "").toLowerCase();
+  return msg.includes("not found") || msg.includes("file not found");
 }
 
 // Ensure exports directory exists in temp
@@ -3768,10 +3861,12 @@ app.post("/api/projects/:projectId/merge", upload.single("audio"), async (req, r
       const startOffset =
         targetDuration > originalDuration ? 0 : Math.max(0, (originalDuration - targetDuration) / 2);
 
-      const driveId =
+      const driveIdRaw =
         (typeof video.driveFileId === "string" && video.driveFileId.trim()) ||
         extractGoogleDriveFileId(video.driveLink) ||
-        null;
+        extractGoogleDriveFileId(video.driveDirectLink) ||
+        "";
+      const driveId = normalizeGoogleDriveFileId(driveIdRaw) || null;
 
       timeline.push({
         clipId,
