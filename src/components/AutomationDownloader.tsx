@@ -75,6 +75,81 @@ export function buildScenesForMergeFromQueue(
   return out;
 }
 
+/** Clip gửi lên server reupload — gộp Queue SUCCESS + Drive trên scenes (timeline). */
+export type ReuploadClipPayload = {
+  id: string;
+  stockUrl: string;
+  stockTitle: string;
+  driveFileId?: string;
+  driveLink?: string;
+  driveDirectLink?: string;
+};
+
+function buildReuploadClipsPayload(
+  jobs: Job[],
+  scenes: any[] | undefined,
+  selectedVideos: { id: string; stockUrl: string; title: string }[],
+): ReuploadClipPayload[] {
+  const out: ReuploadClipPayload[] = [];
+  const seenStock = new Set<string>();
+
+  const push = (p: ReuploadClipPayload) => {
+    const su = (p.stockUrl || "").trim();
+    if (!su || seenStock.has(su)) return;
+    if (!resolveDriveFileIdForVideo(p)) return;
+    seenStock.add(su);
+    out.push({
+      ...p,
+      stockUrl: su,
+      stockTitle: (p.stockTitle || "Video").trim() || "Video",
+    });
+  };
+
+  for (const j of jobs) {
+    if (j.status !== "success") continue;
+    push({
+      id: j.id,
+      stockUrl: j.stockUrl,
+      stockTitle: j.stockTitle,
+      driveFileId: j.driveFileId,
+      driveLink: j.driveLink,
+      driveDirectLink: j.driveDirectLink,
+    });
+  }
+
+  for (const clip of selectedVideos) {
+    const su = (clip.stockUrl || "").trim();
+    if (!su || seenStock.has(su)) continue;
+
+    let v: any = null;
+    for (const scene of scenes || []) {
+      if (!scene.videos?.length) continue;
+      for (const vid of scene.videos) {
+        if (
+          (vid.stockUrl && String(vid.stockUrl).trim() === su) ||
+          (clip.id && vid.url === clip.id)
+        ) {
+          v = vid;
+          break;
+        }
+      }
+      if (v) break;
+    }
+    if (!v) continue;
+
+    push({
+      id: clip.id,
+      stockUrl: su,
+      stockTitle: clip.title || v.title || "Video",
+      driveFileId: v.driveFileId,
+      driveLink: v.driveLink,
+      driveDirectLink: v.driveDirectLink,
+    });
+  }
+
+  return out;
+}
+
 const LiveBrowser = ({ job, projectId }: { job: Job; projectId: string }) => {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [clicked, setClicked] = useState(false);
@@ -450,18 +525,11 @@ export function AutomationDownloader({
     return vids;
   }, [scenes]);
 
-  /** Job SUCCESS có ít nhất một id/link Drive hợp lệ — dùng cho upload lại hàng loạt. */
-  const jobsAbleToReuploadFromDrive = useMemo(() => {
-    return jobs.filter(
-      (j) =>
-        j.status === "success" &&
-        !!resolveDriveFileIdForVideo({
-          driveFileId: j.driveFileId,
-          driveLink: j.driveLink,
-          driveDirectLink: j.driveDirectLink,
-        }),
-    );
-  }, [jobs]);
+  /** Clip có id/link Drive để re-upload (ưu tiên Queue SUCCESS, bổ sung từ scenes / timeline). */
+  const reuploadClipPayload = useMemo(
+    () => buildReuploadClipsPayload(jobs, scenes, selectedVideos),
+    [jobs, scenes, selectedVideos],
+  );
 
   /** Merge final chỉ ghép file gốc trên Drive — mọi clip trong timeline phải có Drive ID / link. */
   const mergeDriveReady = useMemo(() => {
@@ -545,10 +613,16 @@ export function AutomationDownloader({
         const data = JSON.parse(event.data);
         if (data.jobs) {
            setJobs(prevJobs => {
+              const incoming = data.jobs as Job[];
+              // Phiên server mới thường gửi jobs: [] — không ghi đè cache local / jobs đã hydrate.
+              if (incoming.length === 0 && prevJobs.length > 0) {
+                return prevJobs;
+              }
+
               const newScenes = JSON.parse(JSON.stringify(scenes));
               let scenesMutated = false;
 
-              for (const newJob of data.jobs as Job[]) {
+              for (const newJob of incoming as Job[]) {
                 if (newJob.status !== "success") continue;
                 const oldJob = prevJobs.find((j) => j.id === newJob.id);
                 const transitioned =
@@ -605,14 +679,14 @@ export function AutomationDownloader({
               }
 
               const hadError = prevJobs.some((j: Job) => j.status === "error");
-              const hasErrorNow = data.jobs.filter(
+              const hasErrorNow = incoming.filter(
                 (j: Job) => j.status === "error" && j.error,
               );
               if (!hadError && hasErrorNow.length > 0) {
                  const rootError = hasErrorNow.find((j: Job) => j.error && !j.error.includes("AUTO_STOP")) || hasErrorNow[0];
                  setNotifiError(`Hệ thống tự động dừng: ${rootError.error}`);
               }
-              return data.jobs;
+              return incoming;
            });
         }
       } catch (e) {}
@@ -695,16 +769,16 @@ export function AutomationDownloader({
       setActiveSubTab("auth");
       return;
     }
-    if (jobsAbleToReuploadFromDrive.length === 0) {
+    if (reuploadClipPayload.length === 0) {
       toast.error(
-        "Không có job SUCCESS nào có link/id Drive để tải về và upload lại.",
+        "Không có clip nào trên timeline/Queue có link hoặc id Google Drive hợp lệ để upload lại.",
       );
       return;
     }
     if (mergeInProgress || reuploadDriveBusy) return;
 
     const ok = window.confirm(
-      `Upload lại ${jobsAbleToReuploadFromDrive.length} clip vào folder đích?\n\n` +
+      `Upload lại ${reuploadClipPayload.length} clip vào folder đích?\n\n` +
         `Hệ thống sẽ: tải từ file Drive hiện có (theo Queue) → upload file mới vào folder bạn đã dán link.\n` +
         `Firestore + Queue sẽ nhận id/link mới (file cũ trên Drive vẫn có thể còn nếu bạn không xóa).`,
     );
@@ -720,6 +794,7 @@ export function AutomationDownloader({
           projectId,
           driveToken: config.driveAccessToken || undefined,
           driveFolderId: selectedFolderId,
+          clips: reuploadClipPayload,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -732,7 +807,7 @@ export function AutomationDownloader({
         toast.error(msg);
         return;
       }
-      const n = typeof data.count === "number" ? data.count : jobsAbleToReuploadFromDrive.length;
+      const n = typeof data.count === "number" ? data.count : reuploadClipPayload.length;
       toast.success(
         `Đã bắt đầu upload lại ${n} clip. Xem tiến trình trên Queue; xong rồi lưu project và thử Merge.`,
         { duration: 6000 },
@@ -869,7 +944,7 @@ export function AutomationDownloader({
       </AnimatePresence>
       
       {/* Top Status Bar */}
-      <div className="h-10 border-b border-[#b8b8b0] flex items-center justify-between px-6 bg-[#cacac5] text-[10px] font-bold uppercase tracking-widest text-[#4a4a40]">
+      <div className="min-h-10 border-b border-[#b8b8b0] flex flex-wrap items-center justify-between gap-y-2 gap-x-4 px-6 py-1.5 bg-[#cacac5] text-[10px] font-bold uppercase tracking-widest text-[#4a4a40]">
         <div className="flex items-center gap-4">
           <button 
             onClick={onClose}
@@ -885,7 +960,7 @@ export function AutomationDownloader({
           <div className="w-px h-4 bg-[#b8b8b0]"></div>
           <div>Project ID: <span className="text-[#1a1a1a]">{projectId ? projectId.substring(0, 8) : "N/A"}...</span></div>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 justify-end shrink-0 max-w-full">
             {scenes?.length > 0 && (
               <button
                 type="button"
@@ -902,7 +977,7 @@ export function AutomationDownloader({
                 Đồng bộ Drive cache
               </button>
             )}
-            {jobsAbleToReuploadFromDrive.length > 0 && (
+            {reuploadClipPayload.length > 0 && (
               <button
                 type="button"
                 onClick={() => void handleBulkReuploadToTargetFolder()}
@@ -917,16 +992,16 @@ export function AutomationDownloader({
                 title={
                   !selectedFolderId
                     ? "Cần link folder đích (Auth Cookies)."
-                    : "Tải từng clip từ Google Drive (theo Queue SUCCESS) rồi upload file mới vào folder đích — id/link mới cho merge."
+                    : "Tải từng clip từ Google Drive (timeline + Queue) rồi upload file mới vào folder đích — id/link mới cho merge."
                 }
-                className="text-[10px] font-bold uppercase tracking-wide px-3 py-1 rounded border border-emerald-800/40 bg-emerald-200/90 text-emerald-950 hover:bg-emerald-300 flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="text-[10px] font-bold uppercase tracking-wide px-3 py-1 rounded border border-emerald-800/40 bg-emerald-200/90 text-emerald-950 hover:bg-emerald-300 flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
               >
                 {reuploadDriveBusy ? (
                   <Loader2 size={12} className="animate-spin" />
                 ) : (
                   <Upload size={12} />
                 )}
-                Upload lại folder đích ({jobsAbleToReuploadFromDrive.length})
+                Upload lại folder đích ({reuploadClipPayload.length})
               </button>
             )}
             {metrics.progress === 100 && metrics.total > 0 ? (

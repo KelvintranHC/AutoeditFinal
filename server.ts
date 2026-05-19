@@ -3366,10 +3366,92 @@ app.post("/api/downloader/cancel", (req, res) => {
   res.json({ success: true, message: "Cancellation signal acknowledged" });
 });
 
+type ClientReuploadClip = {
+  id?: string;
+  stockUrl?: string;
+  stockTitle?: string;
+  driveFileId?: string;
+  driveLink?: string;
+  driveDirectLink?: string;
+};
+
+/** Ghép clip từ client vào session.queue (nếu chưa có job) và trả danh sách job cần re-upload. */
+function mergeClientClipsIntoSessionForReupload(
+  session: { jobs: DownloaderJob[] },
+  clips: ClientReuploadClip[],
+  idSet: Set<string> | null,
+): DownloaderJob[] {
+  const targets: DownloaderJob[] = [];
+  const seenStock = new Set<string>();
+
+  for (const c of clips) {
+    const stockUrl =
+      typeof c.stockUrl === "string" ? c.stockUrl.trim() : "";
+    if (!stockUrl || seenStock.has(stockUrl)) continue;
+
+    const cand = collectDriveIdCandidatesFromList([
+      c.driveFileId,
+      c.driveLink,
+      c.driveDirectLink,
+    ]);
+    if (cand.length === 0) continue;
+
+    const jobId =
+      typeof c.id === "string" && c.id.trim()
+        ? c.id.trim()
+        : stockUrl;
+
+    if (idSet && !idSet.has(jobId)) continue;
+
+    seenStock.add(stockUrl);
+
+    let job = session.jobs.find(
+      (j) => j.stockUrl === stockUrl || j.id === jobId,
+    );
+    if (!job) {
+      job = {
+        id: jobId,
+        stockUrl,
+        stockTitle:
+          typeof c.stockTitle === "string" && c.stockTitle.trim()
+            ? c.stockTitle.trim()
+            : "Video",
+        status: "success",
+        driveFileId: c.driveFileId,
+        driveLink: c.driveLink,
+        driveDirectLink: c.driveDirectLink,
+      };
+      session.jobs.push(job);
+    } else {
+      if (typeof c.driveFileId === "string" && c.driveFileId.trim()) {
+        job.driveFileId = c.driveFileId.trim();
+      }
+      if (typeof c.driveLink === "string" && c.driveLink.trim()) {
+        job.driveLink = c.driveLink.trim();
+      }
+      if (typeof c.driveDirectLink === "string" && c.driveDirectLink.trim()) {
+        job.driveDirectLink = c.driveDirectLink.trim();
+      }
+      if (
+        job.status === "error" &&
+        collectDriveIdCandidatesFromDownloaderJob(job).length > 0
+      ) {
+        job.status = "success";
+        job.error = undefined;
+      }
+    }
+
+    targets.push(job);
+  }
+  return targets;
+}
+
 /**
  * Upload lại hàng loạt: tải từng clip từ file Drive hiện có (theo Queue SUCCESS),
  * rồi upload vào folder đích — tạo file/id mới, cập nhật Firestore videoDownloads.
  * Dùng khi merge báo thiếu file / ID lệch dù xem trên web vẫn được.
+ *
+ * Có thể gửi `clips` từ client (timeline + queue) khi session server rỗng hoặc thiếu job.
  */
 app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
   try {
@@ -3378,8 +3460,9 @@ app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
       driveToken?: string;
       driveFolderId?: string;
       jobIds?: string[];
+      clips?: ClientReuploadClip[];
     };
-    const { projectId, driveToken, driveFolderId, jobIds } = body;
+    const { projectId, driveToken, driveFolderId, jobIds, clips } = body;
 
     if (!projectId || typeof projectId !== "string") {
       return res.status(400).json({ error: "Thiếu projectId." });
@@ -3407,9 +3490,11 @@ app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
     }
 
     if (!downloaderSessions.has(projectId)) {
-      return res.status(404).json({
-        error:
-          "Chưa có phiên download cho project này. Mở Queue và Start Automation ít nhất một lần.",
+      downloaderSessions.set(projectId, {
+        projectId,
+        jobs: [],
+        clients: [],
+        lastActivity: Date.now(),
       });
     }
 
@@ -3437,16 +3522,28 @@ app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
         ? driveToken.trim()
         : undefined;
 
-    const targets = session.jobs.filter((j) => {
-      if (j.status !== "success") return false;
-      if (idSet && !idSet.has(j.id)) return false;
-      return collectDriveIdCandidatesFromDownloaderJob(j).length > 0;
-    });
+    const clipList = Array.isArray(clips) ? clips : [];
+
+    let targets: DownloaderJob[];
+    if (clipList.length > 0) {
+      targets = mergeClientClipsIntoSessionForReupload(
+        session,
+        clipList,
+        idSet,
+      );
+      emitDownloaderUpdate(projectId);
+    } else {
+      targets = session.jobs.filter((j) => {
+        if (j.status !== "success") return false;
+        if (idSet && !idSet.has(j.id)) return false;
+        return collectDriveIdCandidatesFromDownloaderJob(j).length > 0;
+      });
+    }
 
     if (targets.length === 0) {
       return res.status(400).json({
         error:
-          "Không có job SUCCESS nào có link/id Drive để tải về và upload lại. Kiểm tra Queue hoặc chạy Auto.",
+          "Không có clip nào có link/id Google Drive hợp lệ để tải về và upload lại. Kiểm tra Queue, scenes (driveLink / id) hoặc gửi `clips` trong request.",
       });
     }
 
