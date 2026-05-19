@@ -2977,6 +2977,77 @@ app.get("/api/drive/folders", async (req, res) => {
   }
 });
 
+/**
+ * Đồng bộ lại driveLink / driveFileId trên scenes từ Firestore `videoDownloads`
+ * (document id = encodeURIComponent(stockUrl)) — không tải hay upload lại file.
+ * Dùng khi merge báo 404 nhưng pipeline đã từng upload thành công (cache Firestore còn đúng).
+ */
+app.post("/api/drive/resync-scene-videos", async (req, res) => {
+  try {
+    const scenes = req.body?.scenes;
+    if (!Array.isArray(scenes)) {
+      return res
+        .status(400)
+        .json({ error: "Body cần JSON { scenes: Scene[] }" });
+    }
+    const updated = JSON.parse(JSON.stringify(scenes)) as any[];
+    let refreshedCount = 0;
+
+    for (const scene of updated) {
+      if (!scene?.videos || !Array.isArray(scene.videos)) continue;
+      for (const v of scene.videos) {
+        const stockUrl =
+          typeof v.stockUrl === "string" ? v.stockUrl.trim() : "";
+        if (!stockUrl) continue;
+
+        const key = encodeURIComponent(stockUrl);
+        let snap;
+        try {
+          snap = await getDoc(doc(db, "videoDownloads", key));
+        } catch (error) {
+          handleFirestoreError(
+            error,
+            OperationType.GET,
+            "videoDownloads/" + key,
+          );
+          continue;
+        }
+        if (!snap.exists()) continue;
+
+        const data = snap.data() as {
+          driveLink?: string;
+          driveFileId?: string;
+          fileSizeBytes?: number;
+        };
+        const link =
+          typeof data.driveLink === "string" ? data.driveLink.trim() : "";
+        const fidRaw =
+          (typeof data.driveFileId === "string" && data.driveFileId.trim()) ||
+          extractGoogleDriveFileId(link) ||
+          "";
+        const fid = normalizeGoogleDriveFileId(fidRaw);
+        if (!fid && !link) continue;
+
+        if (link) v.driveLink = link;
+        if (fid) {
+          v.driveFileId = (data.driveFileId && data.driveFileId.trim()) || fid;
+          v.driveDirectLink = `https://drive.google.com/uc?export=download&id=${fid}`;
+        }
+        if (typeof data.fileSizeBytes === "number" && data.fileSizeBytes > 0) {
+          v.fileSizeBytes = data.fileSizeBytes;
+        }
+        refreshedCount++;
+      }
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ scenes: updated, refreshedCount });
+  } catch (e: any) {
+    console.error("[api/drive/resync-scene-videos]", e);
+    res.status(500).json({ error: e?.message || "resync thất bại" });
+  }
+});
+
 app.post("/api/downloader/start", async (req, res) => {
   let { projectId, videos, cookies, driveToken, driveFolderId } = req.body;
   if (!projectId || !videos || !Array.isArray(videos)) {

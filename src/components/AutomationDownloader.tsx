@@ -3,9 +3,10 @@ import {
   Loader2, CheckCircle2, XCircle, HardDrive, DownloadCloud, 
   Terminal, History, Key, Monitor, Play, FileText, Activity, 
   BarChart3, ShieldCheck, Zap, List as ListIcon, ArrowLeft, Copy,
-  MonitorPlay, ExternalLink, Download, Link2
+  MonitorPlay, ExternalLink, Download, Link2, RefreshCw
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
+import { toast } from "react-hot-toast";
 import { db, auth, handleFirestoreError, OperationType } from "../lib/firebase";
 import { collection, query, getDocs, doc, setDoc, getDoc, serverTimestamp } from "firebase/firestore";
 import { updateProjectApi } from "../lib/projectApi";
@@ -152,6 +153,7 @@ export function AutomationDownloader({
   const [mergeUploadBusy, setMergeUploadBusy] = useState(false);
   const [mergeUploadedDriveUrl, setMergeUploadedDriveUrl] = useState<string | null>(null);
   const [mergeUploadedDriveDirectUrl, setMergeUploadedDriveDirectUrl] = useState<string | null>(null);
+  const [driveResyncBusy, setDriveResyncBusy] = useState(false);
   
   // Load existing download data from localStorage
   useEffect(() => {
@@ -631,6 +633,50 @@ export function AutomationDownloader({
      if (v) startDownload([v]);
   };
 
+  const handleResyncDriveFromCache = async () => {
+    if (!scenes?.length) {
+      toast.error("Không có phân cảnh để đồng bộ.");
+      return;
+    }
+    setDriveResyncBusy(true);
+    try {
+      const res = await fetch("/api/drive/resync-scene-videos", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scenes }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setNotifiError(
+          typeof data.error === "string"
+            ? data.error
+            : "Đồng bộ Drive cache thất bại.",
+        );
+        return;
+      }
+      const n = typeof data.refreshedCount === "number" ? data.refreshedCount : 0;
+      if (data.scenes && onUpdateScenes) {
+        onUpdateScenes(data.scenes);
+      }
+      if (n > 0) {
+        toast.success(
+          `Đã cập nhật ${n} clip từ Firestore (videoDownloads). Lưu project rồi thử Merge lại.`,
+        );
+      } else {
+        toast(
+          "Không có bản ghi videoDownloads khớp stockUrl. Chạy Auto lại cho clip thiếu hoặc kiểm tra Firestore.",
+          { icon: "ℹ️", duration: 5000 },
+        );
+      }
+    } catch (e: unknown) {
+      setNotifiError(
+        e instanceof Error ? e.message : "Lỗi mạng khi đồng bộ Drive.",
+      );
+    } finally {
+      setDriveResyncBusy(false);
+    }
+  };
+
   const metrics = useMemo(() => {
     const total = jobs.length;
     const success = jobs.filter(j => j.status === "success").length;
@@ -721,6 +767,22 @@ export function AutomationDownloader({
           <div>Project ID: <span className="text-[#1a1a1a]">{projectId ? projectId.substring(0, 8) : "N/A"}...</span></div>
         </div>
         <div className="flex items-center gap-2">
+            {scenes?.length > 0 && (
+              <button
+                type="button"
+                onClick={() => void handleResyncDriveFromCache()}
+                disabled={mergeInProgress || driveResyncBusy}
+                title="Lấy lại link / file ID Google Drive từ Firestore (videoDownloads, theo stockUrl). Không upload lại — dùng khi merge báo 404."
+                className="text-[10px] font-bold uppercase tracking-wide px-3 py-1 rounded border border-amber-700/40 bg-amber-200/90 text-amber-950 hover:bg-amber-300 flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {driveResyncBusy ? (
+                  <Loader2 size={12} className="animate-spin" />
+                ) : (
+                  <RefreshCw size={12} />
+                )}
+                Đồng bộ Drive cache
+              </button>
+            )}
             {metrics.progress === 100 && metrics.total > 0 ? (
               <>
                 <select
