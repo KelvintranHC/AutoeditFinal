@@ -96,7 +96,12 @@ function buildReuploadClipsPayload(
   const push = (p: ReuploadClipPayload) => {
     const su = (p.stockUrl || "").trim();
     if (!su || seenStock.has(su)) return;
-    if (!resolveDriveFileIdForVideo(p)) return;
+    const d = (p.driveDirectLink || "").trim();
+    const hasHttpDirect =
+      /^https?:\/\//i.test(d) &&
+      (/drive\.google\.com/i.test(d) ||
+        /drive\.usercontent\.google\.com/i.test(d));
+    if (!resolveDriveFileIdForVideo(p) && !hasHttpDirect) return;
     seenStock.add(su);
     out.push({
       ...p,
@@ -771,7 +776,7 @@ export function AutomationDownloader({
     }
     if (reuploadClipPayload.length === 0) {
       toast.error(
-        "Không có clip nào trên timeline/Queue có link hoặc id Google Drive hợp lệ để upload lại.",
+        "Không có clip nào có link Direct / id Google Drive hợp lệ (timeline hoặc Queue).",
       );
       return;
     }
@@ -779,8 +784,8 @@ export function AutomationDownloader({
 
     const ok = window.confirm(
       `Upload lại ${reuploadClipPayload.length} clip vào folder đích?\n\n` +
-        `Hệ thống sẽ: tải từ file Drive hiện có (theo Queue) → upload file mới vào folder bạn đã dán link.\n` +
-        `Firestore + Queue sẽ nhận id/link mới (file cũ trên Drive vẫn có thể còn nếu bạn không xóa).`,
+        `Hệ thống sẽ: tải qua link Direct (HTTP) → upload file mới vào folder đích; clip đã nằm sẵn trong folder đích thì bỏ qua (tránh trùng).\n` +
+        `Sau khi xong, link & Direct trên Queue cập nhật theo file mới.`,
     );
     if (!ok) return;
 
@@ -808,8 +813,17 @@ export function AutomationDownloader({
         return;
       }
       const n = typeof data.count === "number" ? data.count : reuploadClipPayload.length;
+      if (n === 0) {
+        toast(
+          typeof data.message === "string"
+            ? data.message
+            : "Không có clip nào cần upload (có thể đã có trong folder đích).",
+          { icon: "ℹ️", duration: 6000 },
+        );
+        return;
+      }
       toast.success(
-        `Đã bắt đầu upload lại ${n} clip. Xem tiến trình trên Queue; xong rồi lưu project và thử Merge.`,
+        `Đã bắt đầu upload lại ${n} clip (tải Direct HTTP). Xem Queue; xong rồi lưu project và thử Merge.`,
         { duration: 6000 },
       );
     } catch (e: unknown) {
@@ -992,7 +1006,7 @@ export function AutomationDownloader({
                 title={
                   !selectedFolderId
                     ? "Cần link folder đích (Auth Cookies)."
-                    : "Tải từng clip từ Google Drive (timeline + Queue) rồi upload file mới vào folder đích — id/link mới cho merge."
+                    : "Tải qua link Direct (HTTP), upload vào folder đích; bỏ qua clip đã có trong folder."
                 }
                 className="text-[10px] font-bold uppercase tracking-wide px-3 py-1 rounded border border-emerald-800/40 bg-emerald-200/90 text-emerald-950 hover:bg-emerald-300 flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed shrink-0"
               >

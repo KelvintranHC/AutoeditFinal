@@ -22,4 +22,4 @@ View your app in AI Studio: https://ai.studio/apps/ea84861c-1494-4829-b419-ce607
 ## Downloader / Merge
 
 - **Đồng bộ Drive cache** (`/api/drive/resync-scene-videos`): chỉ đọc lại Firestore `videoDownloads`, không tải lại file.
-- **Upload lại folder đích** (`POST /api/downloader/reupload-drive-batch`): tải từng clip từ Google Drive (theo Queue và/hoặc payload `clips` từ timeline), upload bản mới vào folder **Target destination**, cập nhật Firestore — dùng khi merge báo thiếu file / id lệch. Nếu SSE trả queue rỗng, client vẫn gửi `clips` từ scenes có `driveLink` / `driveFileId`.
+- **Upload lại folder đích** (`POST /api/downloader/reupload-drive-batch`): tải từng clip qua **link Direct (HTTP)**, upload bản mới vào folder **Target destination**; clip đã có parent = folder đích thì **bỏ qua** (tránh trùng); cập nhật link view/direct + Firestore. Payload `clips` từ timeline khi cần.

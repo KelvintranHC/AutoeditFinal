@@ -992,6 +992,215 @@ function humanDelay(minMs: number, maxMs: number): Promise<void> {
   const r = (Math.random() + Math.random()) / 2;
   return new Promise(r2 => setTimeout(r2, Math.round(minMs + r * span)));
 }
+
+/** Bearer cho tải HTTP Direct + files.get parents. */
+async function getDriveAccessTokenForRequests(
+  clientToken?: string | null,
+): Promise<string | undefined> {
+  try {
+    if (hasDriveConnection()) {
+      return await getValidDriveAccessToken();
+    }
+  } catch {
+    /* dùng token client */
+  }
+  const t = typeof clientToken === "string" ? clientToken.trim() : "";
+  return t || undefined;
+}
+
+/** URL tải qua HTTP (webContent / uc?export=download) — không dùng Drive API alt=media. */
+function pickDriveDirectHttpUrlForReuploadJob(job: DownloaderJob): string | null {
+  const direct = job.driveDirectLink?.trim();
+  if (direct && /^https?:\/\//i.test(direct)) {
+    if (
+      /drive\.google\.com/i.test(direct) ||
+      /drive\.usercontent\.google\.com/i.test(direct)
+    ) {
+      return direct;
+    }
+  }
+  const candidates = collectDriveIdCandidatesFromDownloaderJob(job);
+  if (candidates.length === 0) return null;
+  const id = normalizeGoogleDriveFileId(candidates[0]);
+  if (!id) return null;
+  return `https://drive.google.com/uc?export=download&id=${encodeURIComponent(id)}`;
+}
+
+function parseDriveVirusScanContinueUrl(
+  html: string,
+  fileIdFallback: string,
+): string | null {
+  const t = html.replace(/&amp;/g, "&");
+  const m1 = t.match(/href="(https:\/\/drive\.google\.com\/uc\?[^"]+)"/i);
+  if (m1) return m1[1];
+  const m2 = t.match(/href="(\/uc\?[^"]+)"/i);
+  if (m2) return `https://drive.google.com${m2[1]}`;
+  const m3 = t.match(/action="(https:\/\/drive\.google\.com\/uc[^"]+)"/i);
+  if (m3) return m3[1];
+  if (fileIdFallback && /virus scan|download_warning|Download anyway/i.test(t)) {
+    return `https://drive.google.com/uc?export=download&confirm=t&id=${encodeURIComponent(fileIdFallback)}`;
+  }
+  return null;
+}
+
+/**
+ * Tải video Google Drive qua link Direct (HTTP stream), kèm Bearer nếu có.
+ * Xử lý trang xác nhận virus scan (HTML) bằng follow URL tiếp theo.
+ */
+async function downloadDriveVideoViaHttpDirect(
+  initialUrl: string,
+  destPath: string,
+  accessToken: string | undefined,
+  fileIdHint: string,
+  depth = 0,
+): Promise<void> {
+  if (depth > 4) {
+    throw new Error("Drive: quá nhiều bước xác nhận tải (HTML).");
+  }
+  try {
+    if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+  } catch {
+    /* ignore */
+  }
+
+  const headers: Record<string, string> = {
+    "User-Agent": pickUserAgent(),
+    Accept: "*/*",
+    "Accept-Encoding": "identity",
+  };
+  if (accessToken) {
+    headers.Authorization = `Bearer ${accessToken}`;
+  }
+
+  const response = await axios.get(initialUrl, {
+    responseType: "stream",
+    timeout: 600_000,
+    maxRedirects: 12,
+    httpsAgent: keepAliveAgent,
+    headers,
+    validateStatus: (s) => s >= 200 && s < 400,
+  });
+
+  const writer = fs.createWriteStream(destPath, { highWaterMark: 1 << 20 });
+  try {
+    await streamPipeline(response.data as NodeJS.ReadableStream, writer);
+  } catch (e) {
+    try {
+      if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+
+  const stat = fs.statSync(destPath);
+  if (stat.size < 500_000) {
+    const sniff = fs.readFileSync(destPath, "utf8");
+    const trim = sniff.trimStart();
+    if (trim.startsWith("<!") || trim.startsWith("<html")) {
+      const nextUrl = parseDriveVirusScanContinueUrl(sniff, fileIdHint);
+      try {
+        fs.unlinkSync(destPath);
+      } catch {
+        /* ignore */
+      }
+      if (!nextUrl) {
+        throw new Error(
+          "Drive trả HTML thay vì video — kiểm tra link Direct, quyền file hoặc token Drive.",
+        );
+      }
+      console.log(
+        `[Reupload HTTP] Trang xác nhận Drive — chuyển tiếp: ${nextUrl.slice(0, 96)}…`,
+      );
+      return downloadDriveVideoViaHttpDirect(
+        nextUrl,
+        destPath,
+        accessToken,
+        fileIdHint,
+        depth + 1,
+      );
+    }
+  }
+
+  if (stat.size < 10_000) {
+    try {
+      fs.unlinkSync(destPath);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(
+      `Tải Direct quá nhỏ (${stat.size} B) — có thể không phải file video.`,
+    );
+  }
+}
+
+/** true nếu file đã nằm trong folder đích (tránh upload trùng). */
+async function isDriveFileAlreadyInFolder(
+  fileId: string,
+  targetFolderId: string,
+  auth: InstanceType<typeof google.auth.OAuth2>,
+): Promise<boolean> {
+  const folder = normalizeGoogleDriveFileId(targetFolderId);
+  if (!folder) return false;
+  const id = normalizeGoogleDriveFileId(fileId);
+  if (!id) return false;
+  try {
+    const resolved = await resolveDriveContentFileId(id, auth);
+    const drive = google.drive({ version: "v3", auth });
+    const meta = await drive.files.get({
+      fileId: resolved,
+      fields: "parents",
+      supportsAllDrives: true,
+    });
+    const parents = meta.data.parents || [];
+    return parents.some((p) => p === folder);
+  } catch {
+    return false;
+  }
+}
+
+async function partitionReuploadJobsByTargetFolder(
+  jobs: DownloaderJob[],
+  targetFolderId: string,
+  clientToken?: string,
+): Promise<{ toRun: DownloaderJob[]; skippedInFolder: number }> {
+  let auth: InstanceType<typeof google.auth.OAuth2>;
+  try {
+    auth = resolveDriveAuth(clientToken?.trim() || null);
+  } catch {
+    return { toRun: jobs, skippedInFolder: 0 };
+  }
+
+  const folder = normalizeGoogleDriveFileId(targetFolderId);
+  if (!folder) return { toRun: jobs, skippedInFolder: 0 };
+
+  const toRun: DownloaderJob[] = [];
+  let skippedInFolder = 0;
+
+  for (const job of jobs) {
+    const candidates = collectDriveIdCandidatesFromDownloaderJob(job);
+    const primary = candidates[0];
+    if (!primary) {
+      toRun.push(job);
+      continue;
+    }
+    try {
+      const inFolder = await isDriveFileAlreadyInFolder(primary, folder, auth);
+      if (inFolder) {
+        skippedInFolder++;
+        job.diagnostic =
+          "⏭️ File đã nằm trong folder đích — bỏ qua (tránh trùng).";
+        continue;
+      }
+    } catch {
+      /* không kiểm tra được → vẫn chạy tải + upload */
+    }
+    toRun.push(job);
+  }
+
+  return { toRun, skippedInFolder };
+}
+
 async function humanScrollTo(page: any, element: any) {
   try {
     await element.evaluate((el: HTMLElement) => {
@@ -3394,7 +3603,13 @@ function mergeClientClipsIntoSessionForReupload(
       c.driveLink,
       c.driveDirectLink,
     ]);
-    if (cand.length === 0) continue;
+    const directRaw =
+      typeof c.driveDirectLink === "string" ? c.driveDirectLink.trim() : "";
+    const hasHttpDirect =
+      /^https?:\/\//i.test(directRaw) &&
+      (/drive\.google\.com/i.test(directRaw) ||
+        /drive\.usercontent\.google\.com/i.test(directRaw));
+    if (cand.length === 0 && !hasHttpDirect) continue;
 
     const jobId =
       typeof c.id === "string" && c.id.trim()
@@ -3447,11 +3662,11 @@ function mergeClientClipsIntoSessionForReupload(
 }
 
 /**
- * Upload lại hàng loạt: tải từng clip từ file Drive hiện có (theo Queue SUCCESS),
- * rồi upload vào folder đích — tạo file/id mới, cập nhật Firestore videoDownloads.
- * Dùng khi merge báo thiếu file / ID lệch dù xem trên web vẫn được.
+ * Upload lại hàng loạt: tải qua **link Direct** (HTTP, uc/export=download / webContent),
+ * rồi upload vào folder đích; clip đã có parent = folder đích thì bỏ qua (tránh trùng).
+ * Cập nhật videoDownloads + link view/direct sau upload mới.
  *
- * Có thể gửi `clips` từ client (timeline + queue) khi session server rỗng hoặc thiếu job.
+ * Có thể gửi `clips` từ client (timeline + queue).
  */
 app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
   try {
@@ -3536,7 +3751,10 @@ app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
       targets = session.jobs.filter((j) => {
         if (j.status !== "success") return false;
         if (idSet && !idSet.has(j.id)) return false;
-        return collectDriveIdCandidatesFromDownloaderJob(j).length > 0;
+        return (
+          collectDriveIdCandidatesFromDownloaderJob(j).length > 0 ||
+          pickDriveDirectHttpUrlForReuploadJob(j) != null
+        );
       });
     }
 
@@ -3547,20 +3765,47 @@ app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
       });
     }
 
+    const { toRun, skippedInFolder } = await partitionReuploadJobsByTargetFolder(
+      targets,
+      folderId,
+      tokForApi,
+    );
+
+    if (skippedInFolder > 0) {
+      emitDownloaderUpdate(projectId);
+    }
+
+    if (toRun.length === 0) {
+      return res.json({
+        success: true,
+        message:
+          skippedInFolder > 0
+            ? "Tất cả clip đã có file trong folder đích — không cần upload lại."
+            : "Không có clip nào cần xử lý.",
+        count: 0,
+        skipped: skippedInFolder,
+      });
+    }
+
     reuploadDriveRunning.set(projectId, true);
     res.json({
       success: true,
       message:
-        "Đang upload lại từng clip lên folder đích (tải từ Drive hiện tại → upload mới). Theo dõi trên Queue.",
-      count: targets.length,
+        `Đang tải qua link Direct (HTTP) rồi upload ${toRun.length} clip vào folder đích.` +
+        (skippedInFolder > 0
+          ? ` Đã bỏ qua ${skippedInFolder} clip đã có trong folder.`
+          : ""),
+      count: toRun.length,
+      skippedPrefetch: skippedInFolder,
     });
 
     void (async () => {
       const safePid = projectId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 48);
+      const accessToken = await getDriveAccessTokenForRequests(
+        tokForApi ?? null,
+      );
       try {
-        for (const job of targets) {
-          const candidates = collectDriveIdCandidatesFromDownloaderJob(job);
-          const primary = candidates[0]!;
+        for (const job of toRun) {
           const safeJid = job.id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
           const tmpPath = path.join(
             tempDirBase,
@@ -3571,14 +3816,27 @@ app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
             job.status = "uploading";
             job.error = undefined;
             job.diagnostic =
-              "🔄 Upload lại: tải bản hiện có từ Drive → upload vào folder đích…";
+              "🔄 Upload lại: tải qua link Direct (HTTP) → upload vào folder đích…";
             emitDownloaderUpdate(projectId);
 
-            await downloadFromGoogleDrive(
-              primary,
-              tokForApi ?? null,
+            const directUrl = pickDriveDirectHttpUrlForReuploadJob(job);
+            if (!directUrl) {
+              throw new Error(
+                "Thiếu link Direct hoặc id Drive để tải HTTP.",
+              );
+            }
+            const candidates = collectDriveIdCandidatesFromDownloaderJob(job);
+            const fileIdHint =
+              candidates[0] ||
+              extractGoogleDriveFileId(directUrl) ||
+              "";
+
+            await downloadDriveVideoViaHttpDirect(
+              directUrl,
               tmpPath,
-              candidates.slice(1),
+              accessToken,
+              fileIdHint,
+              0,
             );
 
             try {
@@ -3606,7 +3864,7 @@ app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
             job.driveFileId = driveRes.id ?? undefined;
             job.uploadDuration = Math.round((Date.now() - uploadStart) / 1000);
             job.status = "success";
-            job.diagnostic = `✅ Đã upload lại vào folder đích (${job.uploadDuration}s). ${(job.driveLink || "").slice(0, 72)}…`;
+            job.diagnostic = `✅ Đã upload vào folder đích (${job.uploadDuration}s). ${(job.driveLink || "").slice(0, 72)}…`;
             emitDownloaderUpdate(projectId);
 
             setDoc(doc(db, "videoDownloads", encodeURIComponent(job.stockUrl)), {
