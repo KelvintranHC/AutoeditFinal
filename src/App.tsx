@@ -3379,7 +3379,13 @@ Văn bản: ${scriptText}`;
           setScenes(updatedScenes);
           setIsDirty(true);
         }}
-        onMerge={(res: string) => handleAutomationMerge(selectedProjectId!, scenes, res)}
+        onMerge={(res, scenesForMerge) =>
+          handleAutomationMerge(
+            selectedProjectId!,
+            scenesForMerge ?? scenes,
+            res,
+          )
+        }
         mergeJobId={mergeJobId}
         onMergeJobClear={() => setMergeJobId(null)}
         onProjectPatch={(updated) => {

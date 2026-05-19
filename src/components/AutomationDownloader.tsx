@@ -42,6 +42,39 @@ interface Job {
   error?: string;
 }
 
+/**
+ * Dựng bản sao scenes để merge: ưu tiên link/id Drive từ Queue (job SUCCESS).
+ * Không phụ thuộc thư mục đích trong Auth — chỉ cần pipeline upload đã thành công.
+ */
+export function buildScenesForMergeFromQueue(
+  scenes: any[] | undefined,
+  jobs: Job[],
+): any[] {
+  const out = JSON.parse(JSON.stringify(scenes || [])) as any[];
+  const successJobs = jobs.filter((j) => j.status === "success");
+  if (!out.length || !successJobs.length) return out;
+
+  for (const scene of out) {
+    if (!Array.isArray(scene.videos)) continue;
+    for (const v of scene.videos) {
+      const job = successJobs.find(
+        (j) => j.id === v.url || j.stockUrl === v.stockUrl,
+      );
+      if (!job) continue;
+      const fid = resolveDriveFileIdForVideo({
+        driveFileId: job.driveFileId,
+        driveLink: job.driveLink,
+        driveDirectLink: job.driveDirectLink,
+      });
+      if (!fid) continue;
+      if (job.driveLink) v.driveLink = job.driveLink;
+      v.driveFileId = job.driveFileId || fid;
+      if (job.driveDirectLink) v.driveDirectLink = job.driveDirectLink;
+    }
+  }
+  return out;
+}
+
 const LiveBrowser = ({ job, projectId }: { job: Job; projectId: string }) => {
   const containerRef = React.useRef<HTMLDivElement>(null);
   const [clicked, setClicked] = useState(false);
@@ -139,7 +172,7 @@ export function AutomationDownloader({
   onConnectDrive?: () => void;
   onClose?: () => void;
   onUpdateScenes?: (scenes: any) => void;
-  onMerge?: (resolution: string) => void;
+  onMerge?: (resolution: string, scenesForMerge?: any[]) => void;
   mergeJobId?: string | null;
   onMergeJobClear?: () => void;
   onProjectPatch?: (project: Project) => void;
@@ -677,6 +710,12 @@ export function AutomationDownloader({
     }
   };
 
+  const handleMergeFinalClick = () => {
+    const payload = buildScenesForMergeFromQueue(scenes, jobs);
+    onUpdateScenes?.(payload);
+    onMerge?.(mergeResolution, payload);
+  };
+
   const metrics = useMemo(() => {
     const total = jobs.length;
     const success = jobs.filter(j => j.status === "success").length;
@@ -796,14 +835,14 @@ export function AutomationDownloader({
                   <option value="480p">480p (854×480)</option>
                 </select>
                 <button 
-                  onClick={() => onMerge?.(mergeResolution)}
+                  onClick={handleMergeFinalClick}
                   disabled={!mergeDriveReady || mergeInProgress}
                   title={
                     !mergeDriveReady
-                      ? "Merge chỉ dùng bản gốc trên Drive. Chạy automation đến khi mọi clip upload xong (watermark chỉ để proxy trong Studio)."
+                      ? "Merge chỉ dùng bản gốc trên Drive. Cần mọi clip trong timeline có link/id Drive (ưu tiên dữ liệu Queue SUCCESS)."
                       : mergeSucceeded
-                        ? "Ghép lại video final từ các clip trên Drive"
-                        : "Ghép video từ file Drive đã upload"
+                        ? "Ghép lại video final từ các clip trên Drive (payload lấy từ Queue + Studio)"
+                        : "Ghép video từ file đã upload Drive — không cần nhập lại thư mục đích nếu Queue đã SUCCESS"
                   }
                   className="bg-indigo-600 text-white px-4 py-1 rounded hover:bg-indigo-700 transition-colors flex items-center gap-2 font-bold shadow-[0_0_15px_rgba(79,70,229,0.4)] disabled:opacity-50 disabled:cursor-not-allowed"
                 >
@@ -1001,7 +1040,11 @@ export function AutomationDownloader({
                                  className="flex-1 bg-[#d8d8d4] border border-[#b8b8b0] px-3 py-2 text-xs font-mono outline-none focus:border-[#1a1a1a] transition-all"
                                />
                             </div>
-                            <p className="text-[9px] text-[#6a6a60] italic">Hệ thống sẽ tự động tải video vào thư mục này.</p>
+                            <p className="text-[9px] text-[#6a6a60] italic">
+                              Bắt buộc khi bấm <strong>Start Automation</strong> (upload clip mới).{" "}
+                              <strong>Merge Final Video</strong> dùng link từng file đã SUCCESS trên Queue
+                              — không cần giữ ô này để merge.
+                            </p>
                          </div>
                        )}
                     </div>
