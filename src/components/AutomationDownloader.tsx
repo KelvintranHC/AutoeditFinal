@@ -3,7 +3,7 @@ import {
   Loader2, CheckCircle2, XCircle, HardDrive, DownloadCloud, 
   Terminal, History, Key, Monitor, Play, FileText, Activity, 
   BarChart3, ShieldCheck, Zap, List as ListIcon, ArrowLeft, Copy,
-  MonitorPlay, ExternalLink, Download, Link2, RefreshCw
+  MonitorPlay, ExternalLink, Download, Link2, RefreshCw, Upload
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { toast } from "react-hot-toast";
@@ -187,6 +187,7 @@ export function AutomationDownloader({
   const [mergeUploadedDriveUrl, setMergeUploadedDriveUrl] = useState<string | null>(null);
   const [mergeUploadedDriveDirectUrl, setMergeUploadedDriveDirectUrl] = useState<string | null>(null);
   const [driveResyncBusy, setDriveResyncBusy] = useState(false);
+  const [reuploadDriveBusy, setReuploadDriveBusy] = useState(false);
   
   // Load existing download data from localStorage
   useEffect(() => {
@@ -449,6 +450,19 @@ export function AutomationDownloader({
     return vids;
   }, [scenes]);
 
+  /** Job SUCCESS có ít nhất một id/link Drive hợp lệ — dùng cho upload lại hàng loạt. */
+  const jobsAbleToReuploadFromDrive = useMemo(() => {
+    return jobs.filter(
+      (j) =>
+        j.status === "success" &&
+        !!resolveDriveFileIdForVideo({
+          driveFileId: j.driveFileId,
+          driveLink: j.driveLink,
+          driveDirectLink: j.driveDirectLink,
+        }),
+    );
+  }, [jobs]);
+
   /** Merge final chỉ ghép file gốc trên Drive — mọi clip trong timeline phải có Drive ID / link. */
   const mergeDriveReady = useMemo(() => {
     if (!scenes?.length) return false;
@@ -628,7 +642,7 @@ export function AutomationDownloader({
      setNotifiError(""); // Clear any previous error
      
      try {
-       await fetch("/api/downloader/start", {
+       const res = await fetch("/api/downloader/start", {
          method: "POST",
          headers: { "Content-Type": "application/json" },
          body: JSON.stringify({
@@ -639,6 +653,11 @@ export function AutomationDownloader({
            driveFolderId: selectedFolderId
          }),
        });
+       const data = await res.json().catch(() => ({}));
+       if (res.status === 409 && typeof (data as { error?: string }).error === "string") {
+         setNotifiError((data as { error: string }).error);
+         return;
+       }
      } catch (e: any) {
        console.error(e);
        setNotifiError(`Lỗi kết nối server: ${e.message}`);
@@ -664,6 +683,67 @@ export function AutomationDownloader({
   const retryJob = (jobId: string) => {
      const v = selectedVideos.find(x => x.id === jobId);
      if (v) startDownload([v]);
+  };
+
+  const handleBulkReuploadToTargetFolder = async () => {
+    if (!projectId) {
+      toast.error("Thiếu project.");
+      return;
+    }
+    if (!selectedFolderId) {
+      setNotifiError("Cần Target destination folder link (tab Auth Cookies).");
+      setActiveSubTab("auth");
+      return;
+    }
+    if (jobsAbleToReuploadFromDrive.length === 0) {
+      toast.error(
+        "Không có job SUCCESS nào có link/id Drive để tải về và upload lại.",
+      );
+      return;
+    }
+    if (mergeInProgress || reuploadDriveBusy) return;
+
+    const ok = window.confirm(
+      `Upload lại ${jobsAbleToReuploadFromDrive.length} clip vào folder đích?\n\n` +
+        `Hệ thống sẽ: tải từ file Drive hiện có (theo Queue) → upload file mới vào folder bạn đã dán link.\n` +
+        `Firestore + Queue sẽ nhận id/link mới (file cũ trên Drive vẫn có thể còn nếu bạn không xóa).`,
+    );
+    if (!ok) return;
+
+    setReuploadDriveBusy(true);
+    setNotifiError("");
+    try {
+      const res = await fetch("/api/downloader/reupload-drive-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId,
+          driveToken: config.driveAccessToken || undefined,
+          driveFolderId: selectedFolderId,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg =
+          typeof data.error === "string"
+            ? data.error
+            : `HTTP ${res.status}`;
+        setNotifiError(msg);
+        toast.error(msg);
+        return;
+      }
+      const n = typeof data.count === "number" ? data.count : jobsAbleToReuploadFromDrive.length;
+      toast.success(
+        `Đã bắt đầu upload lại ${n} clip. Xem tiến trình trên Queue; xong rồi lưu project và thử Merge.`,
+        { duration: 6000 },
+      );
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Lỗi mạng.";
+      setNotifiError(msg);
+      toast.error(msg);
+    } finally {
+      setReuploadDriveBusy(false);
+    }
   };
 
   const handleResyncDriveFromCache = async () => {
@@ -820,6 +900,33 @@ export function AutomationDownloader({
                   <RefreshCw size={12} />
                 )}
                 Đồng bộ Drive cache
+              </button>
+            )}
+            {jobsAbleToReuploadFromDrive.length > 0 && (
+              <button
+                type="button"
+                onClick={() => void handleBulkReuploadToTargetFolder()}
+                disabled={
+                  mergeInProgress ||
+                  reuploadDriveBusy ||
+                  !selectedFolderId ||
+                  jobs.some(
+                    (j) => j.status === "downloading" || j.status === "uploading",
+                  )
+                }
+                title={
+                  !selectedFolderId
+                    ? "Cần link folder đích (Auth Cookies)."
+                    : "Tải từng clip từ Google Drive (theo Queue SUCCESS) rồi upload file mới vào folder đích — id/link mới cho merge."
+                }
+                className="text-[10px] font-bold uppercase tracking-wide px-3 py-1 rounded border border-emerald-800/40 bg-emerald-200/90 text-emerald-950 hover:bg-emerald-300 flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {reuploadDriveBusy ? (
+                  <Loader2 size={12} className="animate-spin" />
+                ) : (
+                  <Upload size={12} />
+                )}
+                Upload lại folder đích ({jobsAbleToReuploadFromDrive.length})
               </button>
             )}
             {metrics.progress === 100 && metrics.total > 0 ? (

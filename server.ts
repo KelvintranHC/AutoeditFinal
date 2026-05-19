@@ -837,6 +837,21 @@ function collectDriveIdCandidatesFromList(
   return out;
 }
 
+/** Folder id từ URL hoặc id thuần (Target destination folder link). */
+function extractDriveFolderIdFromInput(
+  input: string | undefined | null,
+): string {
+  if (input == null || typeof input !== "string") return "";
+  const s = input.trim();
+  if (!s) return "";
+  const folders = s.match(/\/folders\/([-\w]{25,})/);
+  if (folders) return folders[1];
+  const idEq = s.match(/[?&#]id=([-\w]{25,})/);
+  if (idEq) return idEq[1];
+  if (/^[-\w]{20,}$/.test(s)) return s;
+  return s;
+}
+
 function isDriveDownloadAuthRetryable(e: unknown): boolean {
   const err = e as {
     code?: number | string;
@@ -2784,6 +2799,14 @@ interface DownloaderJob {
   error?: string;
 }
 
+function collectDriveIdCandidatesFromDownloaderJob(job: DownloaderJob): string[] {
+  return collectDriveIdCandidatesFromList([
+    job.driveFileId,
+    job.driveLink,
+    job.driveDirectLink,
+  ]);
+}
+
 const downloaderSessions = new Map<string, {
   projectId: string;
   jobs: DownloaderJob[];
@@ -2809,6 +2832,8 @@ const downloaderCancellation = new Map<string, boolean>();
 // loop is still running) only append jobs into session.jobs — the existing
 // loop will pick them up on its next iteration.
 const downloaderRunning = new Map<string, boolean>();
+/** Khóa khi đang chạy upload lại hàng loạt (tải từ Drive → upload folder đích). */
+const reuploadDriveRunning = new Map<string, boolean>();
 // Auto-stop only after this many *consecutive* failures.
 // Single transient errors (network, Cloudflare hiccups) are retried.
 const MAX_CONSECUTIVE_FAILURES = 2;
@@ -3052,6 +3077,13 @@ app.post("/api/downloader/start", async (req, res) => {
   let { projectId, videos, cookies, driveToken, driveFolderId } = req.body;
   if (!projectId || !videos || !Array.isArray(videos)) {
     return res.status(400).json({ error: "Invalid request format" });
+  }
+
+  if (reuploadDriveRunning.get(projectId)) {
+    return res.status(409).json({
+      error:
+        "Đang chạy upload lại clip lên Drive (hàng loạt). Đợi xong rồi mới Start Automation.",
+    });
   }
 
   // Load from cookies.json if empty
@@ -3332,6 +3364,196 @@ app.post("/api/downloader/cancel", (req, res) => {
   }
   
   res.json({ success: true, message: "Cancellation signal acknowledged" });
+});
+
+/**
+ * Upload lại hàng loạt: tải từng clip từ file Drive hiện có (theo Queue SUCCESS),
+ * rồi upload vào folder đích — tạo file/id mới, cập nhật Firestore videoDownloads.
+ * Dùng khi merge báo thiếu file / ID lệch dù xem trên web vẫn được.
+ */
+app.post("/api/downloader/reupload-drive-batch", async (req, res) => {
+  try {
+    const body = req.body as {
+      projectId?: string;
+      driveToken?: string;
+      driveFolderId?: string;
+      jobIds?: string[];
+    };
+    const { projectId, driveToken, driveFolderId, jobIds } = body;
+
+    if (!projectId || typeof projectId !== "string") {
+      return res.status(400).json({ error: "Thiếu projectId." });
+    }
+
+    const folderId = extractDriveFolderIdFromInput(driveFolderId);
+    if (!folderId) {
+      return res
+        .status(400)
+        .json({ error: "Thiếu driveFolderId (link hoặc id folder đích)." });
+    }
+
+    try {
+      const tok =
+        typeof driveToken === "string" && driveToken.trim()
+          ? driveToken.trim()
+          : null;
+      resolveDriveAuth(tok);
+    } catch (e: any) {
+      return res.status(400).json({
+        error:
+          e?.message ||
+          "Google Drive chưa kết nối. Cần driveToken hoặc OAuth server.",
+      });
+    }
+
+    if (!downloaderSessions.has(projectId)) {
+      return res.status(404).json({
+        error:
+          "Chưa có phiên download cho project này. Mở Queue và Start Automation ít nhất một lần.",
+      });
+    }
+
+    if (downloaderRunning.get(projectId)) {
+      return res.status(409).json({
+        error:
+          "Đang chạy Auto Download/Upload. Dừng hoặc đợi xong rồi mới upload lại hàng loạt.",
+      });
+    }
+
+    if (reuploadDriveRunning.get(projectId)) {
+      return res.status(409).json({
+        error: "Đang chạy upload lại Drive hàng loạt cho project này.",
+      });
+    }
+
+    const session = downloaderSessions.get(projectId)!;
+    const idSet =
+      Array.isArray(jobIds) && jobIds.length > 0
+        ? new Set(jobIds.map((x) => String(x)))
+        : null;
+
+    const tokForApi =
+      typeof driveToken === "string" && driveToken.trim()
+        ? driveToken.trim()
+        : undefined;
+
+    const targets = session.jobs.filter((j) => {
+      if (j.status !== "success") return false;
+      if (idSet && !idSet.has(j.id)) return false;
+      return collectDriveIdCandidatesFromDownloaderJob(j).length > 0;
+    });
+
+    if (targets.length === 0) {
+      return res.status(400).json({
+        error:
+          "Không có job SUCCESS nào có link/id Drive để tải về và upload lại. Kiểm tra Queue hoặc chạy Auto.",
+      });
+    }
+
+    reuploadDriveRunning.set(projectId, true);
+    res.json({
+      success: true,
+      message:
+        "Đang upload lại từng clip lên folder đích (tải từ Drive hiện tại → upload mới). Theo dõi trên Queue.",
+      count: targets.length,
+    });
+
+    void (async () => {
+      const safePid = projectId.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 48);
+      try {
+        for (const job of targets) {
+          const candidates = collectDriveIdCandidatesFromDownloaderJob(job);
+          const primary = candidates[0]!;
+          const safeJid = job.id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
+          const tmpPath = path.join(
+            tempDirBase,
+            `reupload_${safePid}_${safeJid}_${Date.now()}.mp4`,
+          );
+
+          try {
+            job.status = "uploading";
+            job.error = undefined;
+            job.diagnostic =
+              "🔄 Upload lại: tải bản hiện có từ Drive → upload vào folder đích…";
+            emitDownloaderUpdate(projectId);
+
+            await downloadFromGoogleDrive(
+              primary,
+              tokForApi ?? null,
+              tmpPath,
+              candidates.slice(1),
+            );
+
+            try {
+              job.fileSizeBytes = fs.statSync(tmpPath).size;
+            } catch {
+              job.fileSizeBytes = undefined;
+            }
+
+            const uploadStart = Date.now();
+            const fileName = `${job.stockTitle.replace(/[^a-z0-9]/gi, "_").toLowerCase()}_redrive_${Date.now()}.mp4`;
+            const driveRes = await uploadToGoogleDrive(
+              tmpPath,
+              fileName,
+              tokForApi ?? null,
+              folderId,
+            );
+
+            job.driveLink =
+              driveRes.webViewLink || driveRes.webContentLink || "";
+            job.driveDirectLink =
+              driveRes.webContentLink ||
+              (driveRes.id
+                ? `https://drive.google.com/uc?export=download&id=${driveRes.id}`
+                : undefined);
+            job.driveFileId = driveRes.id ?? undefined;
+            job.uploadDuration = Math.round((Date.now() - uploadStart) / 1000);
+            job.status = "success";
+            job.diagnostic = `✅ Đã upload lại vào folder đích (${job.uploadDuration}s). ${(job.driveLink || "").slice(0, 72)}…`;
+            emitDownloaderUpdate(projectId);
+
+            setDoc(doc(db, "videoDownloads", encodeURIComponent(job.stockUrl)), {
+              stockUrl: job.stockUrl,
+              driveLink: job.driveLink,
+              driveFileId: job.driveFileId ?? null,
+              fileSizeBytes: job.fileSizeBytes ?? null,
+              createdAt: new Date(),
+            }).catch((err: any) => {
+              handleFirestoreError(
+                err,
+                OperationType.WRITE,
+                "videoDownloads/" + encodeURIComponent(job.stockUrl),
+              );
+            });
+          } catch (e: any) {
+            console.error(
+              `[Reupload Drive] job ${job.id}:`,
+              e?.message || e,
+            );
+            job.status = "error";
+            job.error = (e?.message || "Re-upload failed").substring(0, 200);
+            job.diagnostic = `❌ Upload lại thất bại: ${(e?.message || "").slice(0, 120)}`;
+            emitDownloaderUpdate(projectId);
+          } finally {
+            try {
+              if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath);
+            } catch {
+              /* ignore */
+            }
+          }
+
+          await humanDelay(2000, 5000);
+        }
+      } finally {
+        reuploadDriveRunning.delete(projectId);
+        emitDownloaderUpdate(projectId);
+      }
+    })();
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : "reupload-drive-batch lỗi";
+    console.error("[api/downloader/reupload-drive-batch]", msg);
+    return res.status(500).json({ error: msg });
+  }
 });
 
 app.post("/api/downloader/interact", async (req, res) => {
