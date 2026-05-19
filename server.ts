@@ -513,6 +513,40 @@ async function uploadToGoogleDrive(
   }
 }
 
+const DRIVE_SHORTCUT_MIME = "application/vnd.google-apps.shortcut";
+
+/**
+ * Meta files.get — giải shortcut (Drive lưu .mp4 đôi khi là shortcut tới target).
+ * Chuỗi tối đa 8 bước tránh vòng lặp.
+ */
+async function resolveDriveContentFileId(
+  fileId: string,
+  auth: InstanceType<typeof google.auth.OAuth2>,
+  depth = 0,
+): Promise<string> {
+  if (depth > 8) {
+    throw new Error("Drive: chuỗi shortcut quá sâu");
+  }
+  const id = normalizeGoogleDriveFileId(fileId);
+  if (!id) throw new Error("Drive id rỗng sau chuẩn hoá");
+
+  const drive = google.drive({ version: "v3", auth });
+  const meta = await drive.files.get({
+    fileId: id,
+    fields: "id,mimeType,shortcutDetails(targetId,targetMimeType)",
+    supportsAllDrives: true,
+  });
+  const mime = meta.data.mimeType || "";
+  const targetId = meta.data.shortcutDetails?.targetId;
+  if (mime === DRIVE_SHORTCUT_MIME && targetId) {
+    console.log(
+      `[Drive] Shortcut ${id.slice(0, 14)}… → target ${targetId.slice(0, 14)}…`,
+    );
+    return resolveDriveContentFileId(targetId, auth, depth + 1);
+  }
+  return meta.data.id || id;
+}
+
 /**
  * Tải nội dung file Drive (alt=media). Bắt buộc supportsAllDrives — thiếu flag này
  * file trong Shared Drive thường trả 404 dù link xem trên web vẫn mở được.
@@ -523,11 +557,14 @@ async function streamGoogleDriveFileToPath(
   destPath: string,
 ): Promise<void> {
   const drive = google.drive({ version: "v3", auth });
+  const resolvedId = await resolveDriveContentFileId(fileId, auth);
   const dest = fs.createWriteStream(destPath);
-  console.log(`[Drive] Downloading file ${fileId.slice(0, 16)}… → ${destPath}`);
+  console.log(
+    `[Drive] Downloading file ${resolvedId.slice(0, 16)}… → ${destPath}`,
+  );
 
   const response = await drive.files.get(
-    { fileId, alt: "media", supportsAllDrives: true },
+    { fileId: resolvedId, alt: "media", supportsAllDrives: true },
     { responseType: "stream" },
   );
 
@@ -545,14 +582,19 @@ async function streamGoogleDriveFileToPath(
 /**
  * Ưu tiên OAuth server (nếu có); nếu 404/403 thì thử lại bằng access token từ app
  * (trường hợp file thuộc tài khoản/ngữ cảnh mà token client truy cập được).
+ * `extraIdCandidates`: id/link dự phòng khi id chính sai nhưng driveLink còn đúng.
  */
 async function downloadFromGoogleDrive(
   fileId: string,
   accessToken: string | null | undefined,
   destPath: string,
+  extraIdCandidates: string[] = [],
 ): Promise<string> {
-  const id = normalizeGoogleDriveFileId(fileId);
-  if (!id) {
+  const candidates = collectDriveIdCandidatesFromList([
+    fileId,
+    ...extraIdCandidates,
+  ]);
+  if (candidates.length === 0) {
     throw new Error(
       `Drive file id không hợp lệ: ${String(fileId).slice(0, 48)}`,
     );
@@ -577,29 +619,41 @@ async function downloadFromGoogleDrive(
   }
 
   let lastErr: unknown;
-  for (let i = 0; i < strategies.length; i++) {
-    const { auth, label } = strategies[i];
-    try {
-      if (i > 0 && fs.existsSync(destPath)) {
-        try {
-          fs.unlinkSync(destPath);
-        } catch {
-          /* ignore */
-        }
+  for (const { auth, label } of strategies) {
+    if (fs.existsSync(destPath)) {
+      try {
+        fs.unlinkSync(destPath);
+      } catch {
+        /* ignore */
       }
-      await streamGoogleDriveFileToPath(id, auth, destPath);
-      console.log(`[Drive] Download complete (${label}): ${destPath}`);
-      return destPath;
-    } catch (e) {
-      lastErr = e;
-      const hasNext = i < strategies.length - 1;
-      if (hasNext && isDriveDownloadAuthRetryable(e)) {
-        console.warn(
-          `[Drive] ${label} không tải được id=${id.slice(0, 12)}… — thử cách xác thực khác`,
+    }
+    for (let ci = 0; ci < candidates.length; ci++) {
+      const cand = candidates[ci];
+      try {
+        await streamGoogleDriveFileToPath(cand, auth, destPath);
+        console.log(
+          `[Drive] Download complete (${label}, ứng viên ${ci + 1}/${candidates.length}): ${destPath}`,
         );
-        continue;
+        return destPath;
+      } catch (e) {
+        lastErr = e;
+        if (fs.existsSync(destPath)) {
+          try {
+            fs.unlinkSync(destPath);
+          } catch {
+            /* ignore */
+          }
+        }
+        const moreCand = ci < candidates.length - 1;
+        if (isDriveDownloadAuthRetryable(e) && moreCand) {
+          console.warn(
+            `[Drive] ${label} — id ${cand.slice(0, 14)}… lỗi quyền/404, thử ứng viên tiếp theo`,
+          );
+          continue;
+        }
+        if (!isDriveDownloadAuthRetryable(e)) throw e;
+        break;
       }
-      throw e;
     }
   }
   throw lastErr;
@@ -749,7 +803,38 @@ function normalizeGoogleDriveFileId(raw: string | undefined | null): string {
   s = s.replace(/[.\u3000\s]+$/g, "");
   if (!s) return "";
   const extracted = extractGoogleDriveFileId(s);
-  return extracted || s;
+  const base = (extracted || s).trim();
+  const sanitized = base.replace(/[^A-Za-z0-9_-]/g, "");
+  if (sanitized.length >= 20 && sanitized.length <= 120) return sanitized;
+  return base.replace(/[.\u3000\s]+$/g, "").trim();
+}
+
+/** Gom mọi nguồn (id / link) → danh sách id duy nhất; thứ tự = độ ưu tiên thử tải. */
+function collectDriveIdCandidatesFromList(
+  sources: (string | null | undefined)[],
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (raw: string | null | undefined) => {
+    if (raw == null || typeof raw !== "string") return;
+    const t = raw.trim();
+    if (!t) return;
+    const n = normalizeGoogleDriveFileId(t);
+    if (n && !seen.has(n)) {
+      seen.add(n);
+      out.push(n);
+    }
+    const ex = extractGoogleDriveFileId(t);
+    if (ex) {
+      const n2 = normalizeGoogleDriveFileId(ex);
+      if (n2 && !seen.has(n2)) {
+        seen.add(n2);
+        out.push(n2);
+      }
+    }
+  };
+  for (const s of sources) push(s);
+  return out;
 }
 
 function isDriveDownloadAuthRetryable(e: unknown): boolean {
@@ -3610,7 +3695,10 @@ app.post("/api/edit-video", upload.single("audio"), async (req, res) => {
             if (!success && driveFileId && driveToken) {
                console.log(`[Final] Attempting Drive download for ${driveFileId}`);
                try {
-                 await downloadFromGoogleDrive(driveFileId, driveToken, rawPath);
+                 await downloadFromGoogleDrive(driveFileId, driveToken, rawPath, [
+                   typeof video.driveLink === "string" ? video.driveLink : "",
+                   typeof video.driveDirectLink === "string" ? video.driveDirectLink : "",
+                 ]);
                  success = true;
                } catch (e) {
                  console.error("[Final] Drive download failed", e);
@@ -3838,7 +3926,8 @@ app.post("/api/projects/:projectId/merge", upload.single("audio"), async (req, r
     clipId: string;
     rawPath: string;
     trimmedPath: string;
-    driveFileId: string | null;
+    /** Danh sách id/link ưu tiên thử — driveFileId sai vẫn có thể lấy id đúng từ driveLink. */
+    driveIdCandidates: string[];
     targetDuration: number;
     startOffset: number;
   };
@@ -3861,18 +3950,17 @@ app.post("/api/projects/:projectId/merge", upload.single("audio"), async (req, r
       const startOffset =
         targetDuration > originalDuration ? 0 : Math.max(0, (originalDuration - targetDuration) / 2);
 
-      const driveIdRaw =
-        (typeof video.driveFileId === "string" && video.driveFileId.trim()) ||
-        extractGoogleDriveFileId(video.driveLink) ||
-        extractGoogleDriveFileId(video.driveDirectLink) ||
-        "";
-      const driveId = normalizeGoogleDriveFileId(driveIdRaw) || null;
+      const driveIdCandidates = collectDriveIdCandidatesFromList([
+        typeof video.driveFileId === "string" ? video.driveFileId : undefined,
+        typeof video.driveLink === "string" ? video.driveLink : undefined,
+        typeof video.driveDirectLink === "string" ? video.driveDirectLink : undefined,
+      ]);
 
       timeline.push({
         clipId,
         rawPath: path.join(tempDir, `${clipId}_raw.mp4`),
         trimmedPath: path.join(tempDir, `${clipId}.mp4`),
-        driveFileId: driveId,
+        driveIdCandidates,
         targetDuration,
         startOffset,
       });
@@ -3892,7 +3980,9 @@ app.post("/api/projects/:projectId/merge", upload.single("audio"), async (req, r
     });
   }
 
-  const missingDrive = timeline.filter((c) => !c.driveFileId).map((c) => c.clipId);
+  const missingDrive = timeline
+    .filter((c) => c.driveIdCandidates.length === 0)
+    .map((c) => c.clipId);
   if (missingDrive.length > 0) {
     return res.status(400).json({
       error:
@@ -3936,17 +4026,27 @@ app.post("/api/projects/:projectId/merge", upload.single("audio"), async (req, r
         const batch = timeline.slice(i, i + CONCURRENCY);
         await Promise.all(
           batch.map(async (clip) => {
-            const fileId = clip.driveFileId as string;
-            appendMergeLog(mergeJobId, `Tải Drive HD ${clip.clipId} (fileId=${fileId.slice(0, 12)}…)`);
+            const candidates = clip.driveIdCandidates;
+            const primary = candidates[0];
+            const extra = candidates.slice(1);
+            appendMergeLog(
+              mergeJobId,
+              `Tải Drive HD ${clip.clipId} (fileId=${primary.slice(0, 12)}…${extra.length ? ` +${extra.length} id dự phòng` : ""})`,
+            );
             try {
-              await downloadFromGoogleDrive(fileId, driveToken, clip.rawPath);
+              await downloadFromGoogleDrive(
+                primary,
+                driveToken,
+                clip.rawPath,
+                extra,
+              );
             } catch (e: any) {
               const em = (e?.message || "unknown").slice(0, 200);
               appendMergeLog(mergeJobId, `Drive lỗi ${clip.clipId}: ${em}`);
               throw new Error(`Drive tải thất bại ${clip.clipId}: ${em}`);
             }
             appendMergeLog(mergeJobId, `Đã tải xong ${clip.clipId}`);
-            console.log(`[Merge] Drive file downloaded clip=${clip.clipId} fileId=${fileId}`);
+            console.log(`[Merge] Drive file downloaded clip=${clip.clipId}`);
           }),
         );
         completedDownloads += batch.length;
