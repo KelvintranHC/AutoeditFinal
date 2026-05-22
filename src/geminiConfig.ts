@@ -1,6 +1,7 @@
 /**
- * Gemini generateContent defaults for structured JSON analysis (SRT / keywords).
- * Caps thinking tokens on 2.5 models — largest cost driver in token breakdown.
+ * Gemini generateContent defaults cho phân tích JSON (SRT / keywords).
+ * Gemini 2.5+ extended thinking: `thinkingBudget` phải ∈ [512, 24576] hoặc bỏ hẳn
+ * `thinkingConfig` để tắt thinking (đừng gửi 0 — hay bị INVALID_ARGUMENT).
  */
 
 export type GeminiAnalysisStage =
@@ -17,13 +18,27 @@ export const GEMINI_JSON_MAX_OUTPUT_TOKENS = 4096;
 
 export const GEMINI_JSON_MAX_OUTPUT_CAP = 8192;
 
-/** 0 = thinking off; small budget for semantic beat splitting only. */
+const GEMINI_THINKING_BUDGET_MIN = 512;
+const GEMINI_THINKING_BUDGET_MAX = 24576;
+
+/** Desired raw budgets — values < MIN are clamped; 0 ⇒ thinking off (omit config). */
 const THINKING_BUDGET_BY_STAGE: Record<GeminiAnalysisStage, number> = {
-  meaning_beats: 512,
-  scene_keywords: 256,
-  scene_summaries_vi: 128,
+  meaning_beats: 1024,
+  scene_keywords: 1024,
+  scene_summaries_vi: 1024,
   keyword_generation: 0,
 };
+
+function sanitizeThinkingConfig(
+  rawBudget: number,
+): { thinkingBudget: number; includeThoughts: false } | undefined {
+  if (!Number.isFinite(rawBudget) || rawBudget <= 0) return undefined;
+  const thinkingBudget = Math.min(
+    GEMINI_THINKING_BUDGET_MAX,
+    Math.max(GEMINI_THINKING_BUDGET_MIN, Math.floor(rawBudget)),
+  );
+  return { thinkingBudget, includeThoughts: false };
+}
 
 export function maxOutputTokensForStage(
   stage: GeminiAnalysisStage,
@@ -54,13 +69,13 @@ export function buildGeminiJsonConfig(
   stage: GeminiAnalysisStage,
   opts?: { sceneCount?: number; lineCount?: number },
 ) {
+  const thinkingConfig = sanitizeThinkingConfig(
+    THINKING_BUDGET_BY_STAGE[stage],
+  );
   return {
     responseMimeType: "application/json" as const,
     maxOutputTokens: maxOutputTokensForStage(stage, opts),
-    thinkingConfig: {
-      thinkingBudget: THINKING_BUDGET_BY_STAGE[stage],
-      includeThoughts: false,
-    },
+    ...(thinkingConfig ? { thinkingConfig } : {}),
   };
 }
 
@@ -72,14 +87,11 @@ export function buildGeminiTranscribeConfig(opts?: {
     1,
     Math.ceil((opts?.segmentDurationSec ?? 300) / 60),
   );
+  /** Transcribe không cần extended thinking — không gửi thinkingConfig. */
   return {
     maxOutputTokens: Math.min(
       GEMINI_TRANSCRIBE_MAX_OUTPUT_CAP,
       3072 + minutes * 1100,
     ),
-    thinkingConfig: {
-      thinkingBudget: 0,
-      includeThoughts: false,
-    },
   };
 }
